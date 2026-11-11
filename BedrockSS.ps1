@@ -17,7 +17,7 @@ $AllowedClients = @(
 )
 
 # Name tokens matched against paths / file names. Add client names here.
-$Tokens = @('onix','flarial','oderso','horion','nuvola','zephyr','fate','injector','inject','cheat','hack','client.dll')
+$Tokens = @('onix','flarial','oderso','horion','nuvola','zephyr','fate','injector')
 
 # What a name match means (shown in the report as "What it is").
 $KnownNames = @{
@@ -29,14 +29,14 @@ $KnownNames = @{
     'nuvola'     = 'Nuvola client DLL'
     'zephyr'     = 'Zephyr client DLL'
     'injector'   = 'Injector - loads DLLs into other programs'
-    'inject'     = 'Injection tool / injected DLL'
-    'cheat'      = 'File name contains "cheat"'
-    'hack'       = 'File name contains "hack"'
-    'client.dll' = 'Generic client DLL name'
 }
 
 # Tokens that are scanned for: everything except the allowed clients' own names.
 $ScanTokens = @($Tokens | Where-Object { $t = $_; -not (@($AllowedClients | Where-Object { $_.Names -contains $t }).Count) })
+
+# Only DLLs/.lua in and around the game are scanned by default.
+# Set to $true to also scan Downloads/Desktop/AppData names, BAM and Prefetch (noisier).
+$ExtendedChecks = $false
 
 $OverlaySigners = @('Microsoft','NVIDIA','Advanced Micro Devices','AMD','Intel','Discord','OBS Project','Valve',
     'Overwolf','Realtek','Razer','Logitech','Corsair','SteelSeries','Guru3D','MSI','ASUS','Google','Mozilla',
@@ -53,6 +53,7 @@ function Invoke-BedrockSS {
 
     Write-Host ''
     Write-Host 'BedrockSS - Minecraft Bedrock scanner' -ForegroundColor Magenta
+    Write-Host 'Made by Malasca' -ForegroundColor Magenta
     Write-Host 'Flags are leads to review, not proof of cheating.' -ForegroundColor Gray
     Write-Host ''
 
@@ -60,6 +61,11 @@ function Invoke-BedrockSS {
     if ($procs.Count -eq 0) {
         Write-Host 'Minecraft.Windows.exe is not running. Open Bedrock, join a world, then run again.' -ForegroundColor Red
         return
+    }
+
+    function Set-Step($n, $text) {
+        Write-Host "[$n/3] $text" -ForegroundColor Gray
+        Write-Progress -Id 0 -Activity 'BedrockSS by Malasca' -Status "Step $n of 3: $text" -PercentComplete ((($n - 1) * 100) / 3)
     }
 
     $findings = New-Object System.Collections.ArrayList
@@ -104,9 +110,9 @@ function Invoke-BedrockSS {
     # ------------------------------------------------------------------
     # 1. Loaded modules
     # ------------------------------------------------------------------
-    Write-Host 'Checking loaded modules...' -ForegroundColor Gray
+    Set-Step 1 'Checking DLLs loaded into Minecraft'
     $r = New-Object System.Collections.ArrayList
-    function R($s, $m) { [void]$r.Add(@($s, $m)) }
+    function Add-Reason($s, $m) { [void]$r.Add(@($s, $m)) }
     $overlayNames = New-Object System.Collections.ArrayList
 
     foreach ($p in $procs) {
@@ -116,9 +122,13 @@ function Invoke-BedrockSS {
             continue
         }
 
+        $idx = 0
+        $total = @($mods).Count
         foreach ($m in $mods) {
             $path = $m.FileName
             $name = $m.ModuleName
+            $idx++
+            Write-Progress -Id 1 -ParentId 0 -Activity 'Scanning loaded DLLs' -Status "$idx of $total - $name" -PercentComplete (($idx * 100) / [Math]::Max($total, 1))
             $r.Clear()
 
             $exists = Test-Path -LiteralPath $path
@@ -141,7 +151,7 @@ function Invoke-BedrockSS {
             if ($signer) { foreach ($o in $OverlaySigners) { if ($signer -like "*$o*") { $overlay = $true } } }
 
             if (-not $exists) {
-                R 'High' 'Loaded in memory but the file is missing from disk (deleted or moved after load).'
+                Add-Reason 'High' 'Loaded in memory but the file is missing from disk (deleted or moved after load).'
             }
 
             # Allowed client main DLL: shown, not flagged.
@@ -157,30 +167,30 @@ function Invoke-BedrockSS {
                         "SHA-256      : $sha")
                     continue
                 }
-                if ($al.State -eq 'impostor') { R 'High' $al.Reason }
+                if ($al.State -eq 'impostor') { Add-Reason 'High' $al.Reason }
             }
 
             $lower = $path.ToLower()
             $knownTok = $null
             foreach ($t in $ScanTokens) { if ($lower.Contains($t)) { $knownTok = $t; break } }
             if ($knownTok -and -not ($trusted -and ($inSystem -or $inGame))) {
-                R 'High' "Name matches known client/injector `"$knownTok`"."
+                Add-Reason 'High' "Name matches known client/injector `"$knownTok`"."
             }
 
             if ($exists) {
                 switch ($sigStatus) {
                     'NotSigned' {
-                        if ($userW) { R 'High' 'Unsigned DLL loaded from a user-writable folder.' }
-                        elseif ($added) { R 'High' 'Unsigned DLL loaded from outside the Windows/Minecraft folders.' }
-                        else { R 'Medium' 'Unsigned DLL inside a Windows/Minecraft folder (unusual).' }
+                        if ($userW) { Add-Reason 'High' 'Unsigned DLL loaded from a user-writable folder.' }
+                        elseif ($added) { Add-Reason 'High' 'Unsigned DLL loaded from outside the Windows/Minecraft folders.' }
+                        else { Add-Reason 'Medium' 'Unsigned DLL inside a Windows/Minecraft folder (unusual).' }
                     }
                     'Valid' {
-                        if ($userW -and -not $overlay) { R 'Medium' "Signed by `"$signer`" but loaded from a user-writable folder." }
-                        elseif ($added -and -not $overlay) { R 'Low' "Signed by unrecognized publisher `"$signer`" and loaded outside the Windows/Minecraft folders." }
+                        if ($userW -and -not $overlay) { Add-Reason 'Medium' "Signed by `"$signer`" but loaded from a user-writable folder." }
+                        elseif ($added -and -not $overlay) { Add-Reason 'Low' "Signed by unrecognized publisher `"$signer`" and loaded outside the Windows/Minecraft folders." }
                     }
-                    'NotSupportedFileFormat' { R 'Low' 'Could not verify signature.' }
-                    'Unknown' { R 'Low' 'Could not verify signature.' }
-                    default { R 'High' "Signature failed validation ($sigStatus): tampered, self-signed or untrusted." }
+                    'NotSupportedFileFormat' { Add-Reason 'Low' 'Could not verify signature.' }
+                    'Unknown' { Add-Reason 'Low' 'Could not verify signature.' }
+                    default { Add-Reason 'High' "Signature failed validation ($sigStatus): tampered, self-signed or untrusted." }
                 }
             }
 
@@ -219,10 +229,12 @@ function Invoke-BedrockSS {
         }
     }
 
+    Write-Progress -Id 1 -Activity 'Scanning loaded DLLs' -Completed
+
     # ------------------------------------------------------------------
     # 2. Manually mapped / reflectively loaded code
     # ------------------------------------------------------------------
-    Write-Host 'Scanning memory for manually mapped code...' -ForegroundColor Gray
+    Set-Step 2 'Scanning game memory for hidden/manually mapped code'
     if (-not ('MemScan' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
@@ -304,7 +316,7 @@ public static class MemScan {
     # ------------------------------------------------------------------
     # 3. .dll / .lua files and client folders
     # ------------------------------------------------------------------
-    Write-Host 'Looking for .dll / .lua files and client folders...' -ForegroundColor Gray
+    Set-Step 3 'Checking Bedrock data folders for .dll / .lua files'
     $pkg = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.MinecraftUWP_8wekyb3d8bbwe'
     foreach ($sub in 'RoamingState','LocalState') {
         $root = Join-Path $pkg $sub
@@ -338,6 +350,7 @@ public static class MemScan {
         }
     }
 
+    if ($ExtendedChecks) {
     $scanRoots = @(
         (Join-Path $env:USERPROFILE 'Downloads'),
         (Join-Path $env:USERPROFILE 'Desktop'),
@@ -417,6 +430,10 @@ public static class MemScan {
         }
     }
 
+    }
+
+    Write-Progress -Id 0 -Activity 'BedrockSS by Malasca' -Completed
+
     # ------------------------------------------------------------------
     # Report
     # ------------------------------------------------------------------
@@ -457,7 +474,7 @@ public static class MemScan {
     $out = Join-Path ([Environment]::GetFolderPath('Desktop')) ("BedrockSS_" + (Get-Date -Format 'yyyyMMdd_HHmmss') + ".txt")
     try {
         $lines = foreach ($f in $sorted) { "[$($f.Sev.ToUpper())] $($f.Title)   ($($f.Src))"; foreach ($l in $f.Details) { "  $l" }; '' }
-        Set-Content -Path $out -Value $lines -Encoding UTF8
+        Set-Content -Path $out -Value (@("BedrockSS by Malasca - $(Get-Date -Format 'yyyy-MM-dd HH:mm')", '') + @($lines)) -Encoding UTF8
         Write-Host "Report saved: $out" -ForegroundColor Gray
     } catch { }
 }
