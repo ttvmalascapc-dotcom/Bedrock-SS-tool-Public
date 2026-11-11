@@ -4,7 +4,7 @@
 # Flags are leads for the screensharer to review, not proof of cheating.
 
 # Raw link to THIS file once you host it (used to relaunch as admin).
-$ScriptUrl = 'PUT_YOUR_RAW_LINK_HERE'
+$ScriptUrl = 'https://raw.githubusercontent.com/ttvmalascapc-dotcom/Bedrock-SS-tool-Public/main/BedrockSS.ps1'
 
 # Name tokens matched against paths / file names. Add client names here.
 $Tokens = @('onix','flarial','horion','nuvola','zephyr','fate','injector','inject','cheat','hack','client.dll')
