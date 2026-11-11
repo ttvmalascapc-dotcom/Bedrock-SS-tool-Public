@@ -6,8 +6,37 @@
 # Raw link to THIS file once you host it (used to relaunch as admin).
 $ScriptUrl = 'https://raw.githubusercontent.com/ttvmalascapc-dotcom/Bedrock-SS-tool-Public/main/BedrockSS.ps1'
 
+# Clients whose MAIN dll is allowed. Only extra DLLs added besides these get flagged.
+#   Names  = file-name pieces of the main DLL (matched against the DLL's file name only)
+#   Hashes = SHA-256 of the official DLL. With a hash, a DLL that is only NAMED like the client
+#            but does not match is flagged as an impostor. Recommended: scan your own PC with the
+#            real client loaded, copy its SHA-256 from the "Allowed" line, paste it here.
+$AllowedClients = @(
+    @{ Name = 'Flarial'; Names = @('flarial'); Hashes = @() },
+    @{ Name = 'Oderso';  Names = @('oderso');  Hashes = @() }
+)
+
 # Name tokens matched against paths / file names. Add client names here.
-$Tokens = @('onix','flarial','horion','nuvola','zephyr','fate','injector','inject','cheat','hack','client.dll')
+$Tokens = @('onix','flarial','oderso','horion','nuvola','zephyr','fate','injector','inject','cheat','hack','client.dll')
+
+# What a name match means (shown in the report as "What it is").
+$KnownNames = @{
+    'flarial'    = 'Flarial client DLL'
+    'oderso'     = 'Oderso client DLL'
+    'onix'       = 'Onix client DLL'
+    'fate'       = 'Fate injector - loads extra DLLs into the game'
+    'horion'     = 'Horion client DLL'
+    'nuvola'     = 'Nuvola client DLL'
+    'zephyr'     = 'Zephyr client DLL'
+    'injector'   = 'Injector - loads DLLs into other programs'
+    'inject'     = 'Injection tool / injected DLL'
+    'cheat'      = 'File name contains "cheat"'
+    'hack'       = 'File name contains "hack"'
+    'client.dll' = 'Generic client DLL name'
+}
+
+# Tokens that are scanned for: everything except the allowed clients' own names.
+$ScanTokens = @($Tokens | Where-Object { $t = $_; -not (@($AllowedClients | Where-Object { $_.Names -contains $t }).Count) })
 
 $OverlaySigners = @('Microsoft','NVIDIA','Advanced Micro Devices','AMD','Intel','Discord','OBS Project','Valve',
     'Overwolf','Realtek','Razer','Logitech','Corsair','SteelSeries','Guru3D','MSI','ASUS','Google','Mozilla',
@@ -43,6 +72,32 @@ function Invoke-BedrockSS {
         foreach ($p in $patterns) { if ($text -like "*$p*") { return $true } }
         return $false
     }
+    function Test-AllowedClient($fileName, $path, $sha) {
+        $res = [pscustomobject]@{ State = 'none'; Client = ''; Reason = '' }
+        $susp = Test-Like $path @('\Downloads\','\Desktop\','\Temp\','\Users\Public\')
+        foreach ($c in $AllowedClients) {
+            $hs = @($c.Hashes | ForEach-Object { $_.ToLower() })
+            if ($sha -and ($hs -contains $sha)) { $res.State = 'hash'; $res.Client = $c.Name; return $res }
+        }
+        foreach ($c in $AllowedClients) {
+            foreach ($pat in $c.Names) {
+                if ($fileName.ToLower().Contains($pat)) {
+                    $res.Client = $c.Name
+                    if (@($c.Hashes).Count -gt 0) {
+                        $res.State = 'impostor'
+                        $res.Reason = "Named like $($c.Name) but its hash does not match the official DLL (modified, fake, or the client updated - recheck the hash)."
+                    } elseif ($susp) {
+                        $res.State = 'impostor'
+                        $res.Reason = "Named like $($c.Name) but loaded from Downloads/Desktop/Temp, not an installed location."
+                    } else {
+                        $res.State = 'name'
+                    }
+                    return $res
+                }
+            }
+        }
+        return $res
+    }
     $userDirs = @('\Downloads\','\Temp\','\Desktop\','\AppData\','\Documents\','\Users\Public\','\ProgramData\','\OneDrive\')
     $gameDirs = @('\WindowsApps\Microsoft.Minecraft','\WindowsApps\Microsoft.GamingServices','\XboxGames\Minecraft')
 
@@ -52,6 +107,7 @@ function Invoke-BedrockSS {
     Write-Host 'Checking loaded modules...' -ForegroundColor Gray
     $r = New-Object System.Collections.ArrayList
     function R($s, $m) { [void]$r.Add(@($s, $m)) }
+    $overlayNames = New-Object System.Collections.ArrayList
 
     foreach ($p in $procs) {
         $mods = $null
@@ -66,42 +122,61 @@ function Invoke-BedrockSS {
             $r.Clear()
 
             $exists = Test-Path -LiteralPath $path
-            $sigStatus = 'Unknown'; $signer = ''; $company = ''; $desc = ''; $orig = ''; $sha = ''
+            $inSystem = $path.StartsWith($env:SystemRoot, [StringComparison]::OrdinalIgnoreCase)
+            $inGame = Test-Like $path $gameDirs
+            $userW = Test-Like $path $userDirs
+            $added = (-not $inSystem) -and (-not $inGame)
 
-            if (-not $exists) {
-                R 'High' 'Loaded in memory but the file is missing from disk (deleted or moved after load).'
-            } else {
+            $sigStatus = 'Unknown'; $signer = ''; $company = ''; $desc = ''; $orig = ''; $sha = ''
+            if ($exists) {
                 $sig = Get-AuthenticodeSignature -LiteralPath $path
                 $sigStatus = $sig.Status.ToString()
                 if ($sig.SignerCertificate -and $sig.SignerCertificate.Subject -match 'CN=([^,]+)') { $signer = $Matches[1].Trim('"') }
                 $vi = (Get-Item -LiteralPath $path -Force).VersionInfo
                 if ($vi) { $company = $vi.CompanyName; $desc = $vi.FileDescription; $orig = $vi.OriginalFilename }
+                if ($added) { try { $sha = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLower() } catch { } }
             }
-
-            $inSystem = $path.StartsWith($env:SystemRoot, [StringComparison]::OrdinalIgnoreCase)
-            $inGame = Test-Like $path $gameDirs
-            $userW = Test-Like $path $userDirs
             $trusted = ($sigStatus -eq 'Valid')
             $overlay = $false
             if ($signer) { foreach ($o in $OverlaySigners) { if ($signer -like "*$o*") { $overlay = $true } } }
 
-            $lower = $path.ToLower()
-            if (-not ($trusted -and ($inSystem -or $inGame))) {
-                foreach ($t in $Tokens) {
-                    if ($lower.Contains($t)) { R 'High' "Path matches signature token `"$t`"."; break }
+            if (-not $exists) {
+                R 'High' 'Loaded in memory but the file is missing from disk (deleted or moved after load).'
+            }
+
+            # Allowed client main DLL: shown, not flagged.
+            if ($exists -and $added) {
+                $al = Test-AllowedClient $name $path $sha
+                if ($al.State -eq 'hash' -or $al.State -eq 'name') {
+                    $how = 'hash matches the official DLL'
+                    if ($al.State -eq 'name') { $how = 'matched by file name only (add its SHA-256 to $AllowedClients to verify)' }
+                    Add-Finding 'Info' 'Allowed' $name @(
+                        "What it is   : $($al.Client) main client DLL (allowed)",
+                        "Verified     : $how",
+                        "Path         : $path",
+                        "SHA-256      : $sha")
+                    continue
                 }
+                if ($al.State -eq 'impostor') { R 'High' $al.Reason }
+            }
+
+            $lower = $path.ToLower()
+            $knownTok = $null
+            foreach ($t in $ScanTokens) { if ($lower.Contains($t)) { $knownTok = $t; break } }
+            if ($knownTok -and -not ($trusted -and ($inSystem -or $inGame))) {
+                R 'High' "Name matches known client/injector `"$knownTok`"."
             }
 
             if ($exists) {
                 switch ($sigStatus) {
                     'NotSigned' {
-                        if ($userW) { R 'High' 'Unsigned DLL loaded from a user-writable location.' }
-                        elseif (-not $inSystem -and -not $inGame) { R 'High' 'Unsigned DLL loaded from outside system/game folders.' }
-                        else { R 'Medium' 'Unsigned DLL inside a system/game folder (unusual).' }
+                        if ($userW) { R 'High' 'Unsigned DLL loaded from a user-writable folder.' }
+                        elseif ($added) { R 'High' 'Unsigned DLL loaded from outside the Windows/Minecraft folders.' }
+                        else { R 'Medium' 'Unsigned DLL inside a Windows/Minecraft folder (unusual).' }
                     }
                     'Valid' {
-                        if ($userW -and -not $overlay) { R 'Medium' "Signed by `"$signer`" but loaded from a user-writable location." }
-                        elseif (-not $inSystem -and -not $inGame -and -not $overlay) { R 'Low' "Signed by unrecognized publisher `"$signer`" and loaded outside system/game folders." }
+                        if ($userW -and -not $overlay) { R 'Medium' "Signed by `"$signer`" but loaded from a user-writable folder." }
+                        elseif ($added -and -not $overlay) { R 'Low' "Signed by unrecognized publisher `"$signer`" and loaded outside the Windows/Minecraft folders." }
                     }
                     'NotSupportedFileFormat' { R 'Low' 'Could not verify signature.' }
                     'Unknown' { R 'Low' 'Could not verify signature.' }
@@ -112,15 +187,35 @@ function Invoke-BedrockSS {
             if ($r.Count -gt 0) {
                 $top = 'Low'
                 foreach ($x in $r) { if ($rank[$x[0]] -gt $rank[$top]) { $top = $x[0] } }
-                if ($exists) {
+                if ($exists -and -not $sha) {
                     try { $sha = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLower() } catch { }
                 }
-                $d = @("Path:      $path", "Signature: $sigStatus$(if ($signer) { ' - ' + $signer })")
-                if ($company -or $desc) { $d += "File info: company=[$company] description=[$desc] original name=[$orig]" }
-                if ($sha) { $d += "SHA-256:   $sha" }
-                foreach ($x in $r) { $d += "[$($x[0])] $($x[1])" }
-                Add-Finding $top 'Module' $name $d
+
+                $what = 'DLL added to Minecraft - not part of Windows or the game'
+                if ($knownTok -and $KnownNames.ContainsKey($knownTok)) { $what = $KnownNames[$knownTok] }
+                elseif ($sigStatus -eq 'NotSigned') { $what = 'Unsigned DLL added to Minecraft - no publisher, not part of Windows or the game' }
+                elseif ($exists -and $sigStatus -ne 'Valid') { $what = 'DLL added to Minecraft with a broken or untrusted signature' }
+                foreach ($c in $AllowedClients) {
+                    foreach ($pat in $c.Names) {
+                        if ($lower.Contains($pat)) { $what = "Extra DLL added alongside $($c.Name) - not its main client DLL" }
+                    }
+                }
+                if (-not $exists) { $what = 'DLL still loaded in the game but deleted from disk (hiding its file)' }
+
+                $d = @("What it is   : $what")
+                $first = $true
+                foreach ($x in $r) {
+                    if ($first) { $d += "Why flagged  : $($x[1])"; $first = $false }
+                    else { $d += "               $($x[1])" }
+                }
+                $d += "Path         : $path"
+                $sg = $sigStatus; if ($signer) { $sg += " - $signer" }
+                $d += "Signature    : $sg"
+                if ($company -or $desc -or $orig) { $d += "Says it is   : $desc | company: $company | original name: $orig" }
+                if ($sha) { $d += "SHA-256      : $sha" }
+                Add-Finding $top 'DLL' $name $d
             }
+            elseif ($added -and $overlay) { [void]$overlayNames.Add($name) }
         }
     }
 
@@ -216,15 +311,30 @@ public static class MemScan {
         if (-not (Test-Path $root)) { continue }
         foreach ($d in Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue) {
             $hit = $null
-            foreach ($t in $Tokens) { if ($d.Name.ToLower().Contains($t)) { $hit = $t; break } }
+            foreach ($t in $ScanTokens) { if ($d.Name.ToLower().Contains($t)) { $hit = $t; break } }
             if ($hit) { Add-Finding 'High' 'Files' "Client-like folder in game data: $($d.Name)" $d.FullName }
             else { Add-Finding 'Info' 'Files' "Folder in game data: $sub\$($d.Name)" $d.FullName }
         }
         $files = Get-ChildItem -LiteralPath $root -Recurse -Depth 4 -File -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.Extension -in '.dll', '.lua' }
         foreach ($f in $files) {
-            $kind = if ($f.Extension -eq '.lua') { 'Lua script' } else { 'DLL' }
-            Add-Finding 'Medium' 'Files' "$kind inside Bedrock data folder: $($f.Name)" @($f.FullName, "Modified $($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm')), $($f.Length) bytes")
+            $meta = "Modified     : $($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm')), $($f.Length) bytes"
+            if ($f.Extension -eq '.lua') {
+                Add-Finding 'Medium' 'Script' $f.Name @(
+                    'What it is   : Lua script inside the Bedrock data folder (clients run these inside the game)',
+                    "Path         : $($f.FullName)", $meta)
+                continue
+            }
+            $fsha = ''
+            try { $fsha = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLower() } catch { }
+            $al = Test-AllowedClient $f.Name $f.FullName $fsha
+            if ($al.State -eq 'hash' -or $al.State -eq 'name') {
+                Add-Finding 'Info' 'Allowed' $f.Name @("What it is   : $($al.Client) main client DLL (allowed)", "Path         : $($f.FullName)", "SHA-256      : $fsha")
+            } elseif ($al.State -eq 'impostor') {
+                Add-Finding 'High' 'DLL' $f.Name @("What it is   : DLL in the Bedrock data folder named like $($al.Client)", "Why flagged  : $($al.Reason)", "Path         : $($f.FullName)", $meta, "SHA-256      : $fsha")
+            } else {
+                Add-Finding 'Medium' 'DLL' $f.Name @('What it is   : DLL stored inside the Bedrock data folder (not a normal Minecraft file)', "Path         : $($f.FullName)", $meta, "SHA-256      : $fsha")
+            }
         }
     }
 
@@ -242,7 +352,7 @@ public static class MemScan {
             Where-Object { $_.Extension -in $exts }
         foreach ($f in $files) {
             $hit = $null
-            foreach ($t in $Tokens) { if ($f.Name.ToLower().Contains($t)) { $hit = $t; break } }
+            foreach ($t in $ScanTokens) { if ($f.Name.ToLower().Contains($t)) { $hit = $t; break } }
             if ($hit) {
                 Add-Finding 'Medium' 'Files' "File name matches `"$hit`": $($f.Name)" @($f.FullName, "Modified $($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))")
             }
@@ -251,7 +361,7 @@ public static class MemScan {
 
     foreach ($root in @($env:APPDATA, $env:LOCALAPPDATA)) {
         foreach ($d in Get-ChildItem -LiteralPath $root -Directory -Force -ErrorAction SilentlyContinue) {
-            foreach ($t in $Tokens) {
+            foreach ($t in $ScanTokens) {
                 if ($d.Name.ToLower().Contains($t)) { Add-Finding 'High' 'Files' "AppData folder matches `"$t`"" $d.FullName; break }
             }
         }
@@ -279,7 +389,7 @@ public static class MemScan {
         $shown = 0
         foreach ($e in ($entries | Where-Object { $_.Time -ge $cutoff } | Sort-Object Time -Descending)) {
             $hit = $null
-            foreach ($t in $Tokens) { if ($e.Path.ToLower().Contains($t)) { $hit = $t; break } }
+            foreach ($t in $ScanTokens) { if ($e.Path.ToLower().Contains($t)) { $hit = $t; break } }
             $userFolder = Test-Like $e.Path @('\Downloads\','\Desktop\','\Temp\','\Users\Public\')
             $line = "$($e.Time.ToString('yyyy-MM-dd HH:mm'))  $($e.Path)"
             if ($hit) { Add-Finding 'High' 'BAM' "Recently run, matches `"$hit`"" $line }
@@ -298,7 +408,7 @@ public static class MemScan {
             Add-Finding 'Medium' 'Prefetch' 'Prefetch folder is empty' 'Cleared, or the SysMain service is disabled. Ask the player why.'
         }
         foreach ($f in $pfFiles) {
-            foreach ($t in $Tokens) {
+            foreach ($t in $ScanTokens) {
                 if ($f.Name.ToLower().Contains($t)) {
                     Add-Finding 'High' 'Prefetch' "Prefetch entry matches `"$t`"" "$($f.Name)  (last written $($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm')))"
                     break
@@ -319,13 +429,21 @@ public static class MemScan {
 
     Write-Host ''
     Write-Host ('=' * 78)
-    Write-Host " SCAN SUMMARY:  HIGH $cH  |  MEDIUM $cM  |  LOW $cL"
+    $cA = @($findings | Where-Object { $_.Src -eq 'Allowed' }).Count
+    Write-Host " SCAN SUMMARY:  HIGH $cH  |  MEDIUM $cM  |  LOW $cL  |  allowed client DLLs seen: $cA"
     Write-Host ('=' * 78)
 
     foreach ($f in $sorted) {
         Write-Host ''
-        Write-Host "[$($f.Sev.ToUpper())] ($($f.Src)) $($f.Title)" -ForegroundColor $colors[$f.Sev]
+        $col = $colors[$f.Sev]
+        if ($f.Src -eq 'Allowed') { $col = 'Green' }
+        Write-Host "[$($f.Sev.ToUpper())] $($f.Title)   ($($f.Src))" -ForegroundColor $col
         foreach ($line in $f.Details) { if ($line) { Write-Host "  $line" } }
+    }
+
+    if ($overlayNames.Count -gt 0) {
+        Write-Host ''
+        Write-Host ("Known overlay/driver DLLs (not flagged): " + (($overlayNames | Sort-Object -Unique) -join ', ')) -ForegroundColor DarkGray
     }
 
     if (($cH + $cM + $cL) -eq 0) {
@@ -338,7 +456,7 @@ public static class MemScan {
 
     $out = Join-Path ([Environment]::GetFolderPath('Desktop')) ("BedrockSS_" + (Get-Date -Format 'yyyyMMdd_HHmmss') + ".txt")
     try {
-        $lines = foreach ($f in $sorted) { "[$($f.Sev.ToUpper())] ($($f.Src)) $($f.Title)"; foreach ($l in $f.Details) { "  $l" }; '' }
+        $lines = foreach ($f in $sorted) { "[$($f.Sev.ToUpper())] $($f.Title)   ($($f.Src))"; foreach ($l in $f.Details) { "  $l" }; '' }
         Set-Content -Path $out -Value $lines -Encoding UTF8
         Write-Host "Report saved: $out" -ForegroundColor Gray
     } catch { }
