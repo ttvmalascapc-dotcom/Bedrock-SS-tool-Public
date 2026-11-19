@@ -1,0 +1,26 @@
+name: release
+# Push a tag such as v2.1.0 (or publish a release in the web UI) and GitHub builds the release assets,
+# including a freshly computed SHA-256, so nobody ever types a hash by hand.
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute SHA-256
+        run: |
+          sha256sum BedrockSS.ps1 | awk '{print $1"  BedrockSS.ps1"}' > BedrockSS.ps1.sha256
+          cat BedrockSS.ps1.sha256
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            BedrockSS.ps1
+            BedrockSS.ps1.sha256
+            f.ps1
+            a.ps1
+            d.ps1
