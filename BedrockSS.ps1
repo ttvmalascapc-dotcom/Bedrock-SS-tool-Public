@@ -8,10 +8,16 @@
     It does not collect passwords, cookies, browser data or personal documents.
 #>
 
+param(
+    [string]$Task = '',
+    [string]$ResultFile = '',
+    [switch]$Auto
+)
+
 Set-StrictMode -Version 1.0
 $ErrorActionPreference = 'Stop'
 
-$script:Version   = '2.0.0'
+$script:Version   = '2.1.0'
 $script:DbVersion = '2026.11.10'
 $script:Publisher = 'Malasca'
 $script:SelfPath  = ''
@@ -40,6 +46,10 @@ $script:NextId       = 1
 $script:LastScan     = $null
 $script:RunStart     = 0
 $script:RunErrStart  = 0
+$script:RunId          = 1
+$script:MemoryDenied   = $false
+$script:LastReportBase = ''
+$script:AllowedClientLoaded = $false
 $script:LastRows     = @()
 $script:LastCols     = @()
 $script:McVer        = ''
@@ -61,6 +71,7 @@ $script:Weights = @{
     KnownHash = 100; KnownName = 40; MappedPE = 60; MissingOnDisk = 50; BadSignature = 35
     Unsigned = 15; UserFolder = 15; UnknownPublisher = 5; ScriptInGameData = 30; DllInGameData = 30
     InjectorTrace = 40; TraceCleared = 30; Impostor = 60; OddLocation = 15
+    StringCluster = 30; ObfuscatedString = 20; ClientString = 40
 }
 $script:KindTitle = @{
     KnownHash        = 'Known-bad file hash'
@@ -77,6 +88,9 @@ $script:KindTitle = @{
     TraceCleared     = 'Execution traces missing'
     Impostor         = 'Name matches allowed client but not verified'
     OddLocation      = 'Loaded from outside standard install locations'
+    StringCluster    = 'Cluster of cheat-related strings'
+    ObfuscatedString = 'Cheat-related strings hidden by encoding'
+    ClientString     = 'Known client name found in memory/file contents'
 }
 $script:KindSteps = @{
     KnownHash        = 'Confirm the hash independently (Get-FileHash) and check the entry label under Settings > Known indicator database.'
@@ -93,6 +107,9 @@ $script:KindSteps = @{
     TraceCleared     = 'Check whether the SysMain service was stopped or disabled, and when. Ask the player.'
     Impostor         = 'Compare the DLL hash against the official client release hash.'
     OddLocation      = 'Check why a game-loaded DLL sits outside Windows, Program Files and the game folder.'
+    StringCluster    = 'Open the matched file or note the address; several unrelated cheat feature names in one place is a strong lead. Verify the context of the strings.'
+    ObfuscatedString = 'Strings stored reversed, Base64 or XOR-encoded are meant to avoid simple scans; check which component contains them.'
+    ClientString     = 'Confirm the client name against the allowlist and where it was found.'
 }
 
 # ---------------------------------------------------------------------------
@@ -101,6 +118,8 @@ $script:KindSteps = @{
 $script:NativeSource = @'
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Text;
 using System.Runtime.InteropServices;
 
 public static class BssNative {
@@ -118,6 +137,203 @@ public static class BssNative {
     }
 }
 
+public class StrHit {
+    public long Count;
+    public long[] Offsets = new long[3];
+    public int OffN;
+    public int Key = -1;
+}
+
+// Multi-pattern string search that also finds reversed, UTF-16, Base64 and
+// single-byte-XOR encoded copies of each pattern (read-only, no decoding of the target).
+// Pattern code = id*8 + form  (0 plain, 1 utf16, 2 reversed, 3 base64, 4 xor)
+public class StrEngine {
+    class Auto {
+        public int[] go; public int[] fail; public int[] outCode; public int[] outLen;
+        public int[] outLast; public int[] outLink; public int states;
+    }
+    Auto fwd = null;
+    Auto dif = null;
+    int sf = 0, sd = 0, prev = 0;
+    bool hasPrev = false;
+    long pos = 0;
+    Dictionary<int, StrHit> hits = new Dictionary<int, StrHit>();
+
+    static byte[] Ascii(string s) { return Encoding.ASCII.GetBytes(s); }
+    static byte[] Wide(string s) { return Encoding.Unicode.GetBytes(s); }
+    static byte[] Lower(byte[] b) {
+        byte[] r = new byte[b.Length];
+        for (int i = 0; i < b.Length; i++) { int c = b[i]; if (c >= 65 && c <= 90) c += 32; r[i] = (byte)c; }
+        return r;
+    }
+    static byte[] Rev(byte[] b) { byte[] r = (byte[])b.Clone(); Array.Reverse(r); return r; }
+    static byte[] Diff(byte[] b) {
+        byte[] r = new byte[b.Length - 1];
+        for (int i = 0; i < r.Length; i++) r[i] = (byte)((b[i] ^ b[i + 1]) & 0xDF);
+        return r;
+    }
+    static bool Same(byte[] a, byte[] b) {
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        return true;
+    }
+
+    static Auto BuildAuto(List<byte[]> pats, List<int> codes, List<int> ns, List<int> lasts) {
+        int total = 1;
+        foreach (byte[] p in pats) total += p.Length;
+        Auto a = new Auto();
+        a.go = new int[total * 256];
+        for (int i = 0; i < a.go.Length; i++) a.go[i] = -1;
+        a.fail = new int[total]; a.outCode = new int[total]; a.outLen = new int[total];
+        a.outLast = new int[total]; a.outLink = new int[total];
+        for (int i = 0; i < total; i++) { a.outCode[i] = -1; a.outLink[i] = -1; }
+        int states = 1;
+        for (int pi = 0; pi < pats.Count; pi++) {
+            byte[] p = pats[pi];
+            int st = 0;
+            for (int j = 0; j < p.Length; j++) {
+                int idx = st * 256 + p[j];
+                if (a.go[idx] == -1) { a.go[idx] = states; states++; }
+                st = a.go[idx];
+            }
+            if (a.outCode[st] == -1) {
+                a.outCode[st] = codes[pi];
+                a.outLen[st] = (ns == null) ? p.Length : ns[pi];
+                a.outLast[st] = (lasts == null) ? 0 : lasts[pi];
+            }
+        }
+        int[] queue = new int[states + 1];
+        int qh = 0, qt = 0;
+        for (int c = 0; c < 256; c++) {
+            int t = a.go[c];
+            if (t == -1) a.go[c] = 0; else { a.fail[t] = 0; queue[qt++] = t; }
+        }
+        while (qh < qt) {
+            int cur = queue[qh++];
+            int f = a.fail[cur];
+            a.outLink[cur] = (a.outCode[f] >= 0) ? f : a.outLink[f];
+            for (int c2 = 0; c2 < 256; c2++) {
+                int t2 = a.go[cur * 256 + c2];
+                if (t2 == -1) a.go[cur * 256 + c2] = a.go[f * 256 + c2];
+                else { a.fail[t2] = a.go[f * 256 + c2]; queue[qt++] = t2; }
+            }
+        }
+        a.states = states;
+        return a;
+    }
+
+    void AddD(List<byte[]> dp, List<int> dcode, List<int> dn, List<int> dlast, byte[] orig, int code) {
+        dp.Add(Diff(orig)); dcode.Add(code); dn.Add(orig.Length); dlast.Add((int)orig[orig.Length - 1]);
+    }
+
+    public int Build(string[] texts) {
+        List<byte[]> fp = new List<byte[]>(); List<int> fcode = new List<int>();
+        List<byte[]> dp = new List<byte[]>(); List<int> dcode = new List<int>();
+        List<int> dn = new List<int>(); List<int> dlast = new List<int>();
+        for (int i = 0; i < texts.Length; i++) {
+            string t = texts[i];
+            if (t == null || t.Length < 4) continue;
+            bool ok = true;
+            foreach (char ch in t) { if (ch > 126 || ch < 32) { ok = false; break; } }
+            if (!ok) continue;
+            byte[] a = Ascii(t);
+            byte[] al = Lower(a);
+            fp.Add(al); fcode.Add(i * 8 + 0);
+            fp.Add(Lower(Wide(t))); fcode.Add(i * 8 + 1);
+            if (t.Length >= 5) { fp.Add(Rev(al)); fcode.Add(i * 8 + 2); }
+            if (t.Length >= 5) {
+                for (int k = 0; k < 3; k++) {
+                    byte[] padded = new byte[k + a.Length];
+                    Array.Copy(a, 0, padded, k, a.Length);
+                    string b64 = Convert.ToBase64String(padded);
+                    int start = (k * 8 + 5) / 6;
+                    int end = ((k + a.Length) * 8) / 6;
+                    if (end - start >= 6 && end <= b64.Length) {
+                        fp.Add(Lower(Ascii(b64.Substring(start, end - start)))); fcode.Add(i * 8 + 3);
+                    }
+                }
+            }
+            if (t.Length >= 7) {
+                // XOR forms are matched case-insensitively: the 0x20 case bit is masked out of the byte-difference stream
+                AddD(dp, dcode, dn, dlast, al, i * 8 + 4);
+                AddD(dp, dcode, dn, dlast, Lower(Wide(t)), i * 8 + 4);
+            }
+        }
+        fwd = BuildAuto(fp, fcode, null, null);
+        dif = BuildAuto(dp, dcode, dn, dlast);
+        return fp.Count + dp.Count;
+    }
+
+    public void BeginSegment(long baseOffset) {
+        sf = 0; sd = 0; hasPrev = false; prev = 0; pos = baseOffset - 1;
+    }
+
+    void Hit(int code, long start, int key) {
+        StrHit h;
+        if (!hits.TryGetValue(code, out h)) { h = new StrHit(); h.Key = key; hits[code] = h; }
+        h.Count++;
+        if (h.OffN < 3) { h.Offsets[h.OffN] = start; h.OffN++; }
+    }
+
+    public void Feed(byte[] buf, int len) {
+        if (fwd == null || dif == null) return;
+        int[] gf = fwd.go;
+        int[] gd = dif.go;
+        for (int i = 0; i < len; i++) {
+            int b = buf[i];
+            pos++;
+            int c = (b >= 65 && b <= 90) ? b + 32 : b;
+            sf = gf[sf * 256 + c];
+            int o = (fwd.outCode[sf] >= 0) ? sf : fwd.outLink[sf];
+            while (o >= 0) {
+                Hit(fwd.outCode[o], pos - fwd.outLen[o] + 1, -1);
+                o = fwd.outLink[o];
+            }
+            if (hasPrev) {
+                int d = (prev ^ b) & 0xDF;
+                sd = gd[sd * 256 + d];
+                int o2 = (dif.outCode[sd] >= 0) ? sd : dif.outLink[sd];
+                while (o2 >= 0) {
+                    int key = b ^ dif.outLast[o2];
+                    if (key != 0 && key != 0x20) Hit(dif.outCode[o2], pos - dif.outLen[o2] + 1, key);
+                    o2 = dif.outLink[o2];
+                }
+            }
+            prev = b; hasPrev = true;
+        }
+    }
+
+    public void Clear() { hits.Clear(); }
+
+    public string[] Results() {
+        List<string> r = new List<string>();
+        foreach (KeyValuePair<int, StrHit> kv in hits) {
+            StrHit h = kv.Value;
+            StringBuilder sb = new StringBuilder();
+            sb.Append(kv.Key).Append('|').Append(h.Count).Append('|');
+            for (int i = 0; i < h.OffN; i++) { if (i > 0) sb.Append(';'); sb.Append(h.Offsets[i].ToString("X")); }
+            sb.Append('|').Append(h.Key);
+            r.Add(sb.ToString());
+        }
+        return r.ToArray();
+    }
+
+    public long ScanFile(string path, long maxBytes) {
+        long total = 0;
+        try {
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+                byte[] buf = new byte[1 << 20];
+                BeginSegment(0);
+                int n;
+                while (total < maxBytes && (n = fs.Read(buf, 0, buf.Length)) > 0) { Feed(buf, n); total += n; }
+            }
+        } catch { }
+        return total;
+    }
+
+    public void ScanBytes(byte[] data) { BeginSegment(0); Feed(data, data.Length); }
+}
+
 public class MemProbe {
     [StructLayout(LayoutKind.Sequential)]
     struct MBI {
@@ -131,6 +347,7 @@ public class MemProbe {
 
     IntPtr h = IntPtr.Zero;
     List<long[]> cand = new List<long[]>();
+    List<long[]> allocs = new List<long[]>();
     public int RwxCount = 0;
     public int RegionCount = 0;
 
@@ -143,29 +360,43 @@ public class MemProbe {
     }
 
     public int Collect() {
-        cand.Clear(); RwxCount = 0; RegionCount = 0;
+        cand.Clear(); allocs.Clear(); RwxCount = 0; RegionCount = 0;
         if (h == IntPtr.Zero) return 0;
         List<long[]> regs = new List<long[]>();
+        Dictionary<long, long[]> amap = new Dictionary<long, long[]>();
+        List<long> order = new List<long>();
         long addr = 0;
         UIntPtr len = (UIntPtr)(uint)Marshal.SizeOf(typeof(MBI));
         while (addr >= 0 && addr < 0x7FFFFFFF0000L) {
             MBI m;
             if (VirtualQueryEx(h, (IntPtr)addr, out m, len) == UIntPtr.Zero) break;
             long size = (long)(ulong)m.RegionSize;
+            long rb = m.BaseAddress.ToInt64();
             RegionCount++;
             if (m.State == 0x1000u && m.Type != 0x1000000u) {
-                regs.Add(new long[] { m.BaseAddress.ToInt64(), m.AllocationBase.ToInt64(), size, (long)m.Protect, (long)m.Type });
+                long ab = m.AllocationBase.ToInt64();
+                regs.Add(new long[] { rb, ab, size, (long)m.Protect, (long)m.Type });
                 if (m.Protect == 0x40u && m.Type == 0x20000u && size >= 0x10000) RwxCount++;
+                long[] am;
+                if (!amap.TryGetValue(ab, out am)) { am = new long[] { ab, 0, 0, 0 }; amap[ab] = am; order.Add(ab); }
+                long span = (rb + size) - ab;
+                if (span > am[1]) am[1] = span;
+                if (IsExec(m.Protect)) am[2] = 1;
+                if (m.Type == 0x20000u) am[3] = 1;
             }
-            long next = m.BaseAddress.ToInt64() + size;
+            long next = rb + size;
             if (next <= addr) break;
             addr = next;
         }
         Dictionary<long, bool> exec = new Dictionary<long, bool>();
         foreach (long[] r in regs) { if (IsExec((uint)r[3])) exec[r[1]] = true; }
         foreach (long[] r in regs) { if (r[0] == r[1] && exec.ContainsKey(r[1])) cand.Add(r); }
+        foreach (long k in order) allocs.Add(amap[k]);
         return cand.Count;
     }
+
+    public int AllocCount() { return allocs.Count; }
+    public long[] GetAlloc(int i) { return allocs[i]; }
 
     public string Check(int i) {
         if (h == IntPtr.Zero || i < 0 || i >= cand.Count) return null;
@@ -182,6 +413,41 @@ public class MemProbe {
         if (buf[pe] == (byte)'P' && buf[pe + 1] == (byte)'E' && buf[pe + 2] == 0 && buf[pe + 3] == 0)
             return "PE|" + r[0].ToString("X") + "|" + r[2].ToString() + "|" + r[3].ToString("X");
         return null;
+    }
+
+    // Read-only walk of [start, start+length) feeding every readable committed page to the engine.
+    public long ScanRange(StrEngine e, long start, long length) {
+        if (h == IntPtr.Zero) return 0;
+        long done = 0;
+        long addr = start;
+        long end = start + length;
+        UIntPtr len = (UIntPtr)(uint)Marshal.SizeOf(typeof(MBI));
+        byte[] buf = new byte[1 << 20];
+        while (addr < end) {
+            MBI m;
+            if (VirtualQueryEx(h, (IntPtr)addr, out m, len) == UIntPtr.Zero) break;
+            long rb = m.BaseAddress.ToInt64();
+            long rEnd = rb + (long)(ulong)m.RegionSize;
+            long s = Math.Max(addr, rb);
+            long t = Math.Min(rEnd, end);
+            bool readable = (m.State == 0x1000u) && ((m.Protect & 0x101u) == 0) && (m.Protect != 0);
+            if (readable && t > s) {
+                e.BeginSegment(s);
+                long p = s;
+                while (p < t) {
+                    int want = (int)Math.Min((long)buf.Length, t - p);
+                    UIntPtr got;
+                    if (!ReadProcessMemory(h, (IntPtr)p, buf, (UIntPtr)(uint)want, out got)) break;
+                    int g = (int)(ulong)got;
+                    if (g <= 0) break;
+                    e.Feed(buf, g);
+                    p += g; done += g;
+                }
+            }
+            if (rEnd <= addr) break;
+            addr = rEnd;
+        }
+        return done;
     }
 
     public void Close() { if (h != IntPtr.Zero) { CloseHandle(h); h = IntPtr.Zero; } }
@@ -232,6 +498,20 @@ function Register-Inspected {
 # ---------------------------------------------------------------------------
 # Configuration (settings, allowlist, indicator database)
 # ---------------------------------------------------------------------------
+function New-DefaultStrings {
+    # Best-effort generic list of cheat feature names. Several DIFFERENT ones in one place are required
+    # before anything is reported, so a single common word never triggers a finding.
+    $feature = @('killaura', 'triggerbot', 'aimbot', 'aimassist', 'autoclicker', 'antiknockback', 'bhop', 'airjump',
+        'nofall', 'noslow', 'highjump', 'longjump', 'scaffold', 'nuker', 'autominer', 'freecam', 'xray', 'tracers',
+        'chams', 'jetpack', 'antibot', 'speedhack', 'flyhack', 'cheststealer', 'autoarmor', 'fastbreak', 'fastplace')
+    $utility = @('fullbright', 'clickgui', 'hudeditor', 'nohurtcam', 'modulemanager')
+    $out = New-Object System.Collections.ArrayList
+    foreach ($t in $feature) { [void]$out.Add([pscustomobject]@{ Text = $t; Group = 'Feature'; Note = 'Cheat feature name' }) }
+    foreach ($t in $utility) { [void]$out.Add([pscustomobject]@{ Text = $t; Group = 'Utility'; Note = 'Client utility name (ignored when an allowed client is loaded)' }) }
+    [void]$out.Add([pscustomobject]@{ Text = 'horion'; Group = 'Client'; Note = 'Horion client name' })
+    return @($out)
+}
+
 function New-DefaultConfig {
     $desktop = [Environment]::GetFolderPath('Desktop')
     $allow = New-Object System.Collections.ArrayList
@@ -266,8 +546,10 @@ function New-DefaultConfig {
             ScanMemory = $true
             ScanFiles  = $true
             ScanTraces = $true
+            StringScope = 'Standard'
         }
         Tokens   = @($tokens)
+        Strings  = @(New-DefaultStrings)
         Hashes   = @()
         Allow    = @($allow)
         Reviewed = @()
@@ -286,7 +568,7 @@ function Import-Config {
                 $def.Settings.($p.Name) = $j.Settings.($p.Name)
             }
         }
-        foreach ($k in @('Tokens', 'Hashes', 'Allow', 'Reviewed')) {
+        foreach ($k in @('Tokens', 'Strings', 'Hashes', 'Allow', 'Reviewed')) {
             if ($j.PSObject.Properties[$k]) { $def.$k = @($j.$k) }
         }
     } catch {
@@ -695,25 +977,28 @@ function Find-KnownHash {
 }
 
 function New-Indicator {
-    param([string]$Kind, [string]$Text)
-    [pscustomobject]@{ Kind = $Kind; Text = $Text; Weight = [int]$script:Weights[$Kind] }
+    param([string]$Kind, [string]$Text, [int]$Weight = -1)
+    $w = [int]$script:Weights[$Kind]
+    if ($Weight -ge 0) { $w = $Weight }
+    [pscustomobject]@{ Kind = $Kind; Text = $Text; Weight = $w }
 }
 
 function Test-Allowlist {
     param([string]$Name, [string]$Path, [string]$Sha, [string]$Signer, [string]$SigStatus)
-    $res = [pscustomobject]@{ State = 'none'; Note = '' }
+    $res = [pscustomobject]@{ State = 'none'; Note = ''; Type = '' }
     $entries = @($script:Cfg.Allow)
     $lname = $Name.ToLower()
     $lpath = $Path.ToLower()
 
     foreach ($e in $entries) {
         if ($e.Hash -and $Sha -and ($e.Hash.ToLower() -eq $Sha)) {
-            $res.State = 'allowed'; $res.Note = "SHA-256 is allowlisted ($($e.Note))"; return $res
+            $res.State = 'allowed'; $res.Type = $e.Type; $res.Note = "SHA-256 is allowlisted ($($e.Note))"; return $res
         }
     }
     foreach ($e in $entries) {
         if ($e.Type -eq 'Client' -and $e.Value -and $lname.Contains($e.Value.ToLower())) {
             $v = $e.Value.ToLower()
+            $res.Type = 'Client'
             $hashed = @($entries | Where-Object { $_.Type -eq 'Client' -and $_.Value.ToLower() -eq $v -and $_.Hash }).Count -gt 0
             if ($hashed) {
                 $res.State = 'impostor'
@@ -779,6 +1064,11 @@ function Update-Finding {
     [void]$steps.Add('Weigh this against the player''s explanation and what is visible on their screen before deciding.')
     $F.Steps = @($steps)
     $F.Reviewed = (@($script:Cfg.Reviewed) -contains (Get-ReviewKey $F))
+    # Evidence that was not re-confirmed can never stay at HIGH CONFIDENCE.
+    if ($F.Confirmation -and $F.Class -eq 'HIGH' -and $F.Confirmation -notlike 'Confirmed*' -and $F.Confirmation -notlike 'Recorded*') {
+        $F.Class = 'SUSPICIOUS'
+        $F.Explanation = $F.Explanation + ' Confidence was capped at SUSPICIOUS because the evidence was: ' + $F.Confirmation + '.'
+    }
 }
 
 function Add-Finding {
@@ -798,6 +1088,7 @@ function Add-Finding {
             Sha256 = $Sha; Signature = $Sig; Signer = $Signer; Detected = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
             Modules = (New-Object System.Collections.ArrayList); Indicators = (New-Object System.Collections.ArrayList)
             Observed = (New-Object System.Collections.ArrayList); Explanation = ''; Steps = @(); Reviewed = $false
+            Runs = (New-Object System.Collections.ArrayList); Confirmation = ''
         }
         $script:NextId++
         [void]$script:Findings.Add($f)
@@ -809,6 +1100,7 @@ function Add-Finding {
         if (@($f.Indicators | Where-Object { $_.Kind -eq $i.Kind }).Count -eq 0) { [void]$f.Indicators.Add($i) }
     }
     foreach ($o in $Observed) { if ($f.Observed -notcontains $o) { [void]$f.Observed.Add($o) } }
+    if ($f.Runs -notcontains $script:RunId) { [void]$f.Runs.Add($script:RunId) }
     Update-Finding $f
 }
 
@@ -925,6 +1217,7 @@ function Inspect-Dll {
         $al = Test-Allowlist -Name $Name -Path $Path -Sha $sha -Signer $signer -SigStatus $sigStatus
         if ($al.State -eq 'allowed') {
             if ($script:Mod) { $script:Mod.Allowed++ }
+            if ($al.Type -eq 'Client') { $script:AllowedClientLoaded = $true }
             Add-Observation $script:Mod.Name "Allowlisted: $Name - $($al.Note)" $Path
             return
         }
@@ -1151,6 +1444,229 @@ function Invoke-LuaScan {
     Stop-ScanModule
 }
 
+# ---------------------------------------------------------------------------
+# String scanner: plain, UTF-16, reversed, Base64 and single-byte-XOR forms,
+# plus Lua escape / string.char / concatenation decoding. Read-only.
+# ---------------------------------------------------------------------------
+$script:FormName = @('plain', 'utf16', 'reversed', 'base64', 'xor')
+
+function ConvertFrom-LuaObfuscation {
+    param([string]$Text)
+    $t = $Text
+    for ($round = 0; $round -lt 2; $round++) {
+        $t = [regex]::Replace($t, 'string\.char\(\s*([0-9,\s]+?)\s*\)', {
+            param($m)
+            $chars = foreach ($n in ($m.Groups[1].Value -split '\s*,\s*')) {
+                $v = 0
+                if ([int]::TryParse($n, [ref]$v) -and $v -ge 0 -and $v -le 255) { [char]$v }
+            }
+            '"' + (-join $chars) + '"'
+        })
+        $t = [regex]::Replace($t, '\\(\d{1,3})', { param($m) $v = [int]$m.Groups[1].Value; if ($v -le 255) { [string][char]$v } else { $m.Value } })
+        $t = [regex]::Replace($t, '\\x([0-9A-Fa-f]{2})', { param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
+        $t = [regex]::Replace($t, '\\u\{([0-9A-Fa-f]{1,4})\}', { param($m) [string][char][Convert]::ToInt32($m.Groups[1].Value, 16) })
+        $t = [regex]::Replace($t, '(["''])\s*\.\.\s*\1', '')
+    }
+    return $t
+}
+
+function Read-TextCapped {
+    param([string]$Path, [int]$MaxBytes = 4194304)
+    $fs = New-Object System.IO.FileStream($Path, 'Open', 'Read', 'ReadWrite')
+    try {
+        $buf = New-Object byte[] $MaxBytes
+        $n = $fs.Read($buf, 0, $buf.Length)
+        return [System.Text.Encoding]::UTF8.GetString($buf, 0, $n)
+    } finally { $fs.Dispose() }
+}
+
+function ConvertFrom-StringHits {
+    param([string[]]$Raw, $Sigs)
+    $byId = @{}
+    foreach ($line in @($Raw)) {
+        $p = $line.Split('|')
+        $code = [int]$p[0]
+        $id = $code -shr 3
+        $form = $code -band 7
+        if ($id -ge @($Sigs).Count) { continue }
+        if (-not $byId.ContainsKey($id)) { $byId[$id] = [pscustomobject]@{ Sig = @($Sigs)[$id]; Forms = @{}; Total = [long]0 } }
+        $o = $byId[$id]
+        $o.Forms[$form] = [pscustomobject]@{ Count = [long]$p[1]; Offsets = $p[2]; Key = [int]$p[3] }
+        $o.Total += [long]$p[1]
+    }
+    return @($byId.Values)
+}
+
+function Format-StringHit {
+    param($Hit)
+    $forms = @()
+    foreach ($k in @($Hit.Forms.Keys | Sort-Object)) {
+        $f = $Hit.Forms[$k]
+        $txt = "$($script:FormName[$k]) x$($f.Count)"
+        if ($k -eq 4) { $txt += (' key 0x{0:X2}' -f $f.Key) }
+        $first = ($f.Offsets -split ';')[0]
+        if ($first) { $txt += " @0x$first" }
+        $forms += $txt
+    }
+    return ("'" + $Hit.Sig.Text + "' (" + ($forms -join ', ') + ')')
+}
+
+function Add-StringFinding {
+    param([string]$Name, [string]$Path, [string]$Key, [string]$Scope, [string[]]$Raw, $Sigs, [bool]$ClientAllowed, [string]$Sha = '')
+    $hits = @(ConvertFrom-StringHits $Raw $Sigs)
+    if ($hits.Count -eq 0) { return }
+    $feat = @($hits | Where-Object { $_.Sig.Group -eq 'Feature' -or ($_.Sig.Group -eq 'Utility' -and -not $ClientAllowed) })
+    $cli = @($hits | Where-Object { $_.Sig.Group -eq 'Client' })
+    $obf = @($hits | Where-Object { $_.Sig.Group -ne 'Utility' -and @($_.Forms.Keys | Where-Object { $_ -ge 2 }).Count -gt 0 })
+
+    $ind = New-Object System.Collections.ArrayList
+    if ($feat.Count -ge 3) {
+        $names = (@($feat | Select-Object -First 8 | ForEach-Object { $_.Sig.Text }) -join ', ')
+        [void]$ind.Add((New-Indicator 'StringCluster' "$($feat.Count) distinct cheat-related strings in $Scope ($names)." -Weight ([Math]::Min(70, 10 * $feat.Count))))
+    }
+    if ($cli.Count -gt 0) {
+        $cn = (@($cli | ForEach-Object { $_.Sig.Text }) -join ', ')
+        [void]$ind.Add((New-Indicator 'ClientString' "Known client name found in ${Scope}: $cn."))
+    }
+    if ($obf.Count -gt 0 -and $ind.Count -gt 0) {
+        $on = (@($obf | Select-Object -First 6 | ForEach-Object { $_.Sig.Text }) -join ', ')
+        [void]$ind.Add((New-Indicator 'ObfuscatedString' "Some of these strings were stored reversed, Base64- or XOR-encoded ($on)."))
+    }
+    if ($ind.Count -eq 0) { return }
+
+    $obs = New-Object System.Collections.ArrayList
+    [void]$obs.Add("Scope: $Scope")
+    foreach ($h in @($hits | Sort-Object Total -Descending | Select-Object -First 12)) { [void]$obs.Add('String: ' + (Format-StringHit $h)) }
+    Add-Finding -Name $Name -Path $Path -Sha $Sha -Key $Key -Indicators $ind -Observed @($obs)
+}
+
+function Invoke-StringScan {
+    param([switch]$MemoryOnly)
+    $name = 'String Scanner'
+    Start-ScanModule $name 0
+    if (-not $script:NativeOk) {
+        Add-ScanError $name 'native helper' 'The string engine could not be compiled on this system.'
+        Stop-ScanModule
+        return
+    }
+    $sigs = @($script:Cfg.Strings)
+    if ($sigs.Count -eq 0) {
+        Add-Observation $name 'No string signatures are configured.'
+        Stop-ScanModule
+        return
+    }
+    $eng = New-Object StrEngine
+    [void]$eng.Build([string[]]@($sigs | ForEach-Object { [string]$_.Text }))
+    $heapCap = [long]536870912
+    if ($script:Cfg.Settings.StringScope -eq 'Deep') { $heapCap = [long]3221225472 }
+
+    # --- file targets (Bedrock data DLLs and Lua scripts) ---
+    $fileTargets = New-Object System.Collections.ArrayList
+    if (-not $MemoryOnly -and $script:Cfg.Settings.ScanFiles) {
+        foreach ($f in @(Get-BedrockDataFiles @('.dll'))) { [void]$fileTargets.Add([pscustomobject]@{ Path = $f.FullName; Name = $f.Name; Kind = 'dll' }) }
+        foreach ($f in @(Get-BedrockDataFiles @('.lua'))) { [void]$fileTargets.Add([pscustomobject]@{ Path = $f.FullName; Name = $f.Name; Kind = 'lua' }) }
+    }
+
+    # --- memory targets ---
+    $memItems = New-Object System.Collections.ArrayList
+    $probes = New-Object System.Collections.ArrayList
+    $allowedLoaded = $false
+    try {
+        if ($script:Cfg.Settings.ScanMemory) {
+            foreach ($p in @(Get-BedrockProc)) {
+                $probe = New-Object MemProbe
+                $rc = $probe.Open($p.Id)
+                if ($rc -ne 0) { if ($rc -eq 5) { $script:MemoryDenied = $true }; Add-ScanError $name "PID $($p.Id)" "Windows did not allow reading Minecraft's memory (error $rc)."; continue }
+                [void]$probes.Add($probe)
+                [void]$probe.Collect()
+                try {
+                    foreach ($m in $p.Modules) {
+                        $path = $m.FileName
+                        if ($path.StartsWith($env:SystemRoot, [StringComparison]::OrdinalIgnoreCase) -or (Test-PathLike $path $script:GameDirs)) { continue }
+                        $sg = Get-Sig $path
+                        $al = Test-Allowlist -Name $m.ModuleName -Path $path -Sha (Get-Sha $path) -Signer $sg.Signer -SigStatus $sg.Status
+                        if ($al.State -eq 'allowed') { if ($al.Type -eq 'Client') { $allowedLoaded = $true }; continue }
+                        [void]$memItems.Add([pscustomobject]@{ Type = 'Image'; Probe = $probe; ProcId = $p.Id; Name = $m.ModuleName; Path = $path; Base = [long]$m.BaseAddress.ToInt64(); Size = [long]$m.ModuleMemorySize; First = $false; Last = $false })
+                    }
+                } catch { Add-ScanError $name "PID $($p.Id)" $_.Exception.Message }
+                $heap = New-Object System.Collections.ArrayList
+                $heapBytes = [long]0
+                for ($i = 0; $i -lt $probe.AllocCount(); $i++) {
+                    $a = $probe.GetAlloc($i)
+                    if ($a[2] -eq 1) {
+                        [void]$memItems.Add([pscustomobject]@{ Type = 'Exec'; Probe = $probe; ProcId = $p.Id; Name = ('Executable allocation @0x' + $a[0].ToString('X')); Path = ''; Base = [long]$a[0]; Size = [long]$a[1]; First = $false; Last = $false })
+                    } elseif ($heapBytes -lt $heapCap) {
+                        $heapBytes += [long]$a[1]
+                        [void]$heap.Add([pscustomobject]@{ Type = 'Heap'; Probe = $probe; ProcId = $p.Id; Name = 'Process memory (heap)'; Path = ''; Base = [long]$a[0]; Size = [long]$a[1]; First = $false; Last = $false })
+                    }
+                }
+                if ($heap.Count -gt 0) {
+                    $heap[0].First = $true
+                    $heap[$heap.Count - 1].Last = $true
+                    foreach ($h in $heap) { [void]$memItems.Add($h) }
+                }
+            }
+        } else { Add-Observation $name 'Memory string scanning is switched off in Settings.' }
+        if (-not $script:Cfg.Settings.ScanMemory -or @(Get-BedrockProc).Count -eq 0) {
+            if (@(Get-BedrockProc).Count -eq 0) { Add-Observation $name 'Minecraft is not running: memory strings were not scanned.' }
+        }
+
+        $script:Mod.Total = $fileTargets.Count + $memItems.Count
+
+        foreach ($t in $fileTargets) {
+            if (Step-ScanModule $t.Name) { break }
+            try {
+                Register-Inspected $t.Path 'File'
+                $sha = Get-Sha $t.Path
+                if ($t.Kind -eq 'dll') {
+                    $sg = Get-Sig $t.Path
+                    $al = Test-Allowlist -Name $t.Name -Path $t.Path -Sha $sha -Signer $sg.Signer -SigStatus $sg.Status
+                    if ($al.State -eq 'allowed') { if ($al.Type -eq 'Client') { $allowedLoaded = $true }; continue }
+                }
+                $eng.Clear()
+                if ($t.Kind -eq 'lua') {
+                    $dec = ConvertFrom-LuaObfuscation (Read-TextCapped $t.Path)
+                    $eng.ScanBytes([System.Text.Encoding]::UTF8.GetBytes($dec))
+                } else {
+                    [void]$eng.ScanFile($t.Path, [long]209715200)
+                }
+                Add-StringFinding -Name $t.Name -Path $t.Path -Key $t.Path.ToLower() -Scope 'the file contents' -Raw $eng.Results() -Sigs $sigs -ClientAllowed $allowedLoaded -Sha $sha
+            } catch { Add-ScanError $name $t.Name $_.Exception.Message }
+        }
+
+        if (-not $script:Mod.Cancelled) {
+            foreach ($it in $memItems) {
+                if (Step-ScanModule ($it.Type + ': ' + $it.Name)) { break }
+                try {
+                    switch ($it.Type) {
+                        'Image' {
+                            $eng.Clear()
+                            [void]$it.Probe.ScanRange($eng, $it.Base, $it.Size)
+                            Add-StringFinding -Name $it.Name -Path $it.Path -Key $it.Path.ToLower() -Scope 'the loaded module image in memory' -Raw $eng.Results() -Sigs $sigs -ClientAllowed $allowedLoaded
+                        }
+                        'Exec' {
+                            $eng.Clear()
+                            [void]$it.Probe.ScanRange($eng, $it.Base, $it.Size)
+                            Add-StringFinding -Name $it.Name -Path '' -Key ("str|mem|$($it.ProcId)|" + $it.Base.ToString('X')) -Scope 'an executable allocation that is not a listed module' -Raw $eng.Results() -Sigs $sigs -ClientAllowed $allowedLoaded
+                        }
+                        'Heap' {
+                            if ($it.First) { $eng.Clear() }
+                            [void]$it.Probe.ScanRange($eng, $it.Base, $it.Size)
+                            if ($it.Last) {
+                                Add-StringFinding -Name $it.Name -Path '' -Key "str|mem|$($it.ProcId)|heap" -Scope 'game heap memory' -Raw $eng.Results() -Sigs $sigs -ClientAllowed $allowedLoaded
+                            }
+                        }
+                    }
+                } catch { Add-ScanError $name $it.Name $_.Exception.Message }
+            }
+        }
+    } finally {
+        foreach ($pr in $probes) { try { $pr.Close() } catch { } }
+    }
+    if ($allowedLoaded) { Add-Observation $name 'An allowed client is loaded: utility-type strings were not counted.' }
+    Stop-ScanModule
+}
+
 function Invoke-MemoryScan {
     $name = 'Memory Integrity Scanner'
     Start-ScanModule $name 0
@@ -1173,7 +1689,8 @@ function Invoke-MemoryScan {
             $probe = New-Object MemProbe
             $rc = $probe.Open($p.Id)
             if ($rc -ne 0) {
-                Add-ScanError $name "PID $($p.Id)" "Could not open the process for reading (Win32 error $rc). Run as Administrator."
+                if ($rc -eq 5) { $script:MemoryDenied = $true }
+                Add-ScanError $name "PID $($p.Id)" "Windows did not allow reading Minecraft's memory (error $rc)."
                 continue
             }
             [void]$probes.Add($probe)
@@ -1205,14 +1722,17 @@ function Invoke-MemoryScan {
 }
 
 function Invoke-InjectionScan {
+    param([switch]$SkipTraces, [switch]$TracesOnly)
     $name = 'Injection Investigation'
+    if (-not (Test-IsAdmin)) { $SkipTraces = $true }
+    $doTraces = $script:Cfg.Settings.ScanTraces -and -not $SkipTraces
     Start-ScanModule $name 0
     $tokens = @(Get-ScanTokens)
     $work = New-Object System.Collections.ArrayList
     $cut = (Get-Date).AddDays(-14)
 
     $bam = @()
-    if ($script:Cfg.Settings.ScanTraces) {
+    if ($doTraces) {
         try { $bam = @(Get-BamEntries) } catch { Add-ScanError $name 'BAM registry' $_.Exception.Message }
     }
     foreach ($e in $bam) {
@@ -1221,19 +1741,22 @@ function Invoke-InjectionScan {
     $pfDir = Join-Path $env:SystemRoot 'Prefetch'
     $pf = @()
     $pfOk = $false
-    if ($script:Cfg.Settings.ScanTraces) {
+    if ($doTraces) {
         try { $pf = @(Get-ChildItem -LiteralPath $pfDir -Filter '*.pf' -ErrorAction Stop); $pfOk = $true }
         catch { Add-ScanError $name 'Prefetch' $_.Exception.Message }
     }
     foreach ($f in $pf) { [void]$work.Add([pscustomobject]@{ Type = 'Prefetch'; Name = $f.Name; Path = $f.FullName; Time = $f.LastWriteTime }) }
-    foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
-        $pp = ''
-        try { $pp = [string]$p.Path } catch { }
-        [void]$work.Add([pscustomobject]@{ Type = 'Process'; Name = $p.ProcessName; Path = $pp; Time = [datetime]::MinValue; Pid = $p.Id })
+    if (-not $TracesOnly) {
+        foreach ($p in @(Get-Process -ErrorAction SilentlyContinue)) {
+            $pp = ''
+            try { $pp = [string]$p.Path } catch { }
+            [void]$work.Add([pscustomobject]@{ Type = 'Process'; Name = $p.ProcessName; Path = $pp; Time = [datetime]::MinValue; Pid = $p.Id })
+        }
     }
     $script:Mod.Total = $work.Count + 1
 
-    if (Step-ScanModule 'Prefetch health check') { Stop-ScanModule; return }
+    if (Step-ScanModule 'Windows traces check') { Stop-ScanModule; return }
+    if (-not $doTraces -and -not $TracesOnly) { Add-Observation $name 'Windows traces (BAM/Prefetch) were not read: Windows only lets administrators read them.' }
     if ($pfOk -and $pf.Count -eq 0) {
         $svc = 'unknown'
         try { $svc = [string](Get-Service -Name 'SysMain' -ErrorAction Stop).Status } catch { }
@@ -1328,7 +1851,7 @@ function Invoke-RecentFileScan {
 
 function Invoke-Correlation {
     $strongKinds = @('MappedPE', 'KnownName', 'KnownHash', 'MissingOnDisk', 'Impostor')
-    $strong = @($script:Findings | Where-Object { $f = $_; $f.Key -notlike 'corr|*' -and @($f.Indicators | Where-Object { $strongKinds -contains $_.Kind }).Count -gt 0 -and $f.Class -ne 'CLEAN' })
+    $strong = @($script:Findings | Where-Object { $f = $_; $f.Key -notlike 'corr|*' -and @($f.Indicators | Where-Object { $strongKinds -contains $_.Kind }).Count -gt 0 -and $f.Class -ne 'CLEAN' -and (-not $f.Confirmation -or $f.Confirmation -like 'Confirmed*') })
     $traces = @($script:Findings | Where-Object { $f = $_; @($f.Indicators | Where-Object { $_.Kind -eq 'InjectorTrace' }).Count -gt 0 })
     if ($strong.Count -eq 0 -or $traces.Count -eq 0) { return }
     $ind = New-Object System.Collections.ArrayList
@@ -1506,6 +2029,291 @@ function Show-ScanResults {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Administrator-only checks run in a SHORT-LIVED elevated child process.
+# The main scanner is never closed or restarted: it waits for the child (-Wait),
+# then merges the child's results from a JSON file. Everything else needs no admin.
+# ---------------------------------------------------------------------------
+function Export-TaskResults {
+    param([string]$Path)
+    $fnd = @($script:Findings | ForEach-Object {
+        $fi = $_
+        [pscustomobject]@{
+            Name = $fi.Name; Path = $fi.Path; Sha256 = $fi.Sha256; Signature = $fi.Signature; Signer = $fi.Signer; Key = $fi.Key
+            Modules = @($fi.Modules)
+            Indicators = @($fi.Indicators | ForEach-Object { [pscustomobject]@{ Kind = $_.Kind; Text = $_.Text; Weight = $_.Weight } })
+            Observed = @($fi.Observed)
+        }
+    })
+    $o = [pscustomobject]@{ Findings = $fnd; Observations = @($script:Observations); Errors = @($script:Errors); Modules = @($script:ModResults); IsAdmin = (Test-IsAdmin) }
+    $o | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+function Import-TaskResults {
+    param([string]$Path)
+    $j = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    foreach ($f in @($j.Findings)) {
+        $ind = New-Object System.Collections.ArrayList
+        foreach ($i in @($f.Indicators)) { [void]$ind.Add((New-Indicator ([string]$i.Kind) ([string]$i.Text) -Weight ([int]$i.Weight))) }
+        if ($ind.Count -eq 0) { continue }
+        $mod = 'Administrator checks'
+        $first = @($f.Modules)
+        if ($first.Count -gt 0) { $mod = ([string]$first[0]) + ' (administrator)' }
+        $sig = ''
+        if ($f.Signature) { $sig = [string]$f.Signature }
+        Add-Finding -Name ([string]$f.Name) -Path ([string]$f.Path) -Sha ([string]$f.Sha256) -Sig $sig -Signer ([string]$f.Signer) -Indicators $ind -Observed @($f.Observed | ForEach-Object { [string]$_ }) -Key ([string]$f.Key) -Module $mod
+    }
+    foreach ($o in @($j.Observations)) { Add-Observation ([string]$o.Module) ([string]$o.Text) ([string]$o.Path) ([string]$o.When) }
+    foreach ($e in @($j.Errors)) {
+        [void]$script:Errors.Add([pscustomobject]@{ Time = [string]$e.Time; Module = [string]$e.Module; Target = [string]$e.Target; Kind = [string]$e.Kind; Message = [string]$e.Message })
+    }
+    foreach ($m in @($j.Modules)) {
+        [void]$script:ModResults.Add([pscustomobject]@{ Name = ([string]$m.Name + ' (administrator)'); Items = $m.Items; Findings = $m.Findings; Allowlisted = $m.Allowlisted; Errors = $m.Errors; Seconds = $m.Seconds; Status = [string]$m.Status })
+    }
+}
+
+function Request-AdminTask {
+    param([string]$Task, [string]$Title, [string]$Why)
+    if (Test-IsAdmin) { return $false }
+    if (-not $script:SelfPath -or -not (Test-Path -LiteralPath $script:SelfPath)) {
+        Add-Observation $Title 'Skipped: needs administrator permission, and the scanner was not started from a file.'
+        return $false
+    }
+    Write-Host ''
+    Write-Seg ('  ' + $script:G.Warn + ' ' + $Title + ' needs administrator permission') 'Yellow'
+    Write-Seg ('  ' + $Why) 'Gray'
+    Write-Seg '  Only this one check runs in a short administrator window. This window keeps waiting and your scan is not restarted.' 'Gray'
+    $a = Read-Choice 'Allow it? (Y = yes, N = skip this check)'
+    if ($a -notmatch '^[Yy]') {
+        Add-Observation $Title 'Skipped by choice (administrator permission was not given).'
+        Write-Status info 'Skipped. The rest of the scan is not affected.'
+        return $false
+    }
+    $dir = Join-Path $env:LOCALAPPDATA 'BedrockSS\work'
+    $res = Join-Path $dir ('task_' + [guid]::NewGuid().ToString('N') + '.json')
+    try { if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null } }
+    catch { Write-Status warn ('Could not prepare a work folder: ' + $_.Exception.Message); return $false }
+    Write-Status info 'Waiting for the administrator window to finish ...'
+    try {
+        $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $script:SelfPath + '"'), '-Task', $Task, '-ResultFile', ('"' + $res + '"'))
+    } catch {
+        Write-Status warn 'Administrator permission was not given, so this check was skipped. The rest of the scan is not affected.'
+        Add-Observation $Title 'Skipped: the Windows administrator prompt was cancelled.'
+        return $false
+    }
+    if (Test-Path -LiteralPath $res) {
+        try {
+            Import-TaskResults $res
+            Write-Status ok ($Title + ' finished and was added to the results.')
+            return $true
+        } catch { Write-Status warn ('Could not read the administrator result: ' + $_.Exception.Message) }
+        finally { try { Remove-Item -LiteralPath $res -Force -ErrorAction SilentlyContinue } catch { } }
+    } else {
+        Write-Status warn 'The administrator window ended without returning results (it may have run under a different Windows account).'
+        Add-Observation $Title 'No result came back from the administrator window.'
+    }
+    return $false
+}
+
+function Start-TaskChild {
+    Import-Config
+    Initialize-Native
+    Initialize-Console
+    $script:RunId = 1
+    Show-Header ('Administrator check: ' + $Task)
+    Write-Status info 'This window runs one check and closes by itself. You do not need to do anything.'
+    $code = 0
+    try {
+        switch ($Task) {
+            'Traces' { Invoke-InjectionScan -TracesOnly }
+            'Memory' { Invoke-MemoryScan; Invoke-StringScan -MemoryOnly }
+            default  { throw "Unknown task '$Task'" }
+        }
+    } catch {
+        $code = 1
+        Add-ScanError ('Administrator ' + $Task) 'task' $_.Exception.Message
+        Write-Status bad ('The check stopped: ' + $_.Exception.Message)
+    }
+    try { if ($ResultFile) { Export-TaskResults $ResultFile } }
+    catch { $code = 2; Write-Status bad ('Could not save the result: ' + $_.Exception.Message); Start-Sleep -Seconds 4 }
+    Write-Status ok 'Done. Closing ...'
+    Start-Sleep -Seconds 2
+    exit $code
+}
+
+function Invoke-InjectionStep {
+    Invoke-InjectionScan
+    if (-not (Test-IsAdmin) -and $script:Cfg.Settings.ScanTraces -and -not $script:CancelAll) {
+        [void](Request-AdminTask 'Traces' 'The Windows traces check' 'It reads the list of programs Windows recorded as recently run (BAM and Prefetch). Windows only lets administrators read that list.')
+    }
+}
+
+function Invoke-MemoryElevationIfNeeded {
+    if ($script:MemoryDenied -and -not (Test-IsAdmin) -and -not $script:CancelAll) {
+        $script:MemoryDenied = $false
+        [void](Request-AdminTask 'Memory' 'The memory check' 'Windows refused to let this window read Minecraft''s memory. The check looks for hidden or injected code and cheat names.')
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Scan passes, second-look confirmation, plain-language completion screen, auto mode
+# ---------------------------------------------------------------------------
+function Invoke-ScanPass {
+    param([int]$Run)
+    $script:RunId = $Run
+    $s = $script:Cfg.Settings
+    Invoke-DllScan
+    if ($Run -eq 1) {
+        if (-not $script:CancelAll) { Invoke-SignatureScan }
+        if (-not $script:CancelAll) { Invoke-HashScan }
+        if (-not $script:CancelAll -and $s.ScanFiles) { Invoke-LuaScan }
+        if (-not $script:CancelAll -and ($s.ScanFiles -or $s.ScanMemory)) { Invoke-StringScan }
+        if (-not $script:CancelAll -and $s.ScanMemory) { Invoke-MemoryScan }
+        if (-not $script:CancelAll -and $s.ScanFiles) { Invoke-RecentFileScan }
+    } else {
+        if (-not $script:CancelAll -and $s.ScanMemory) { Invoke-StringScan -MemoryOnly; Invoke-MemoryScan }
+    }
+}
+
+# Second look at everything flagged. What cannot be reproduced can no longer count as HIGH CONFIDENCE.
+function Confirm-Findings {
+    foreach ($f in @($script:Findings | Where-Object { $_.Class -ne 'CLEAN' })) {
+        $key = [string]$f.Key
+        $conf = ''
+        if ($key -like 'mem|*' -or $key -like 'str|mem|*') {
+            if (@($f.Runs).Count -ge 2) { $conf = 'Confirmed (seen in 2 of 2 scans)' }
+            else { $conf = 'Unconfirmed (seen in only 1 of 2 scans)' }
+        } elseif ($key -like 'bam|*' -or $key -like 'prefetch|*' -or $key -like 'process|*' -or $key -like 'trace|*' -or $key -like 'corr|*') {
+            $conf = 'Recorded (system artifact)'
+        } elseif ($f.Path) {
+            $exists = $false
+            try { $exists = Test-Path -LiteralPath $f.Path -PathType Leaf } catch { }
+            $missingExpected = @($f.Indicators | Where-Object { $_.Kind -eq 'MissingOnDisk' }).Count -gt 0
+            if ($missingExpected) {
+                if (-not $exists) { $conf = 'Confirmed (file still missing from disk)' } else { $conf = 'Changed (file reappeared during the scan)' }
+            } elseif (-not $exists) {
+                $conf = 'Disappeared (file no longer exists on re-check)'
+            } else {
+                $h = ''
+                try { $h = (Get-FileHash -LiteralPath $f.Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLower() } catch { }
+                if ($f.Sha256 -and $h -and $h -ne $f.Sha256) { $conf = 'Changed (hash differs on re-check)' }
+                else { $conf = 'Confirmed (file re-verified)' }
+            }
+        }
+        $f.Confirmation = $conf
+        Update-Finding $f
+    }
+}
+
+$script:FriendlyModule = @{
+    'DLL Scanner'                = 'Programs (DLLs) loaded into Minecraft and its folders'
+    'Digital Signature Scanner'  = 'Who signed those programs'
+    'Hash Scanner'               = 'File fingerprints compared with known cheats'
+    'Lua Scanner'                = 'Script files'
+    'String Scanner'             = 'Cheat names hidden in files and memory (even disguised)'
+    'Memory Integrity Scanner'   = 'Hidden code inside Minecraft'
+    'Injection Investigation'    = 'Signs of injector programs'
+    'Recent File Activity'       = 'Recently downloaded or changed files'
+}
+
+function Show-Completion {
+    param([string]$Title)
+    $runMods = @($script:ModResults | Select-Object -Skip $script:RunStart)
+    $runNames = @($runMods | ForEach-Object { $_.Name }) + @('Correlation')
+    $all = @($script:Findings | Where-Object { $f = $_; @($f.Modules | Where-Object { $runNames -contains $_ }).Count -gt 0 })
+    $bad = @($all | Where-Object { $_.Class -ne 'CLEAN' })
+    $nHigh = @($bad | Where-Object { $_.Class -eq 'HIGH' }).Count
+    $nSus = @($bad | Where-Object { $_.Class -eq 'SUSPICIOUS' }).Count
+    $cancelled = @($runMods | Where-Object { $_.Status -eq 'Cancelled' }).Count -gt 0
+    $errs = 0
+    foreach ($m in $runMods) { $errs += [int]$m.Errors }
+
+    Show-Header ($Title + ' - finished')
+    if ($cancelled) {
+        Write-Seg "  $($script:G.Warn) SCAN CANCELLED - only part of the checks ran" 'Yellow'
+        Write-Seg '  Nothing was changed on this PC. The results below are partial.' 'Gray'
+    } elseif ($nHigh -gt 0) {
+        Write-Seg "  $($script:G.Bad) RESULT: LIKELY CHEAT FOUND" 'Red'
+        Write-Seg '  Several independent signs of cheating were found and re-checked.' 'Gray'
+    } elseif ($nSus -gt 0) {
+        Write-Seg "  $($script:G.Warn) RESULT: SOME THINGS NEED A LOOK" 'Yellow'
+        Write-Seg '  Unusual items were found. This is NOT proof of cheating - a staff member should review them.' 'Gray'
+    } else {
+        Write-Seg "  $($script:G.Ok) RESULT: NOTHING SUSPICIOUS FOUND" 'Green'
+        Write-Seg '  This is not a guarantee: no scan can prove that nothing was used.' 'Gray'
+    }
+    Write-Section 'What was checked'
+    foreach ($m in $runMods) {
+        $base = ([string]$m.Name) -replace ' \(administrator\)$', ''
+        $label = $base
+        if ($script:FriendlyModule.ContainsKey($base)) { $label = $script:FriendlyModule[$base] }
+        $mark = $script:G.Ok; $col = 'Green'
+        if ($m.Status -ne 'Completed') { $mark = $script:G.Warn; $col = 'Yellow' }
+        Write-Seg ('  ' + $mark + ' ') $col -NoNewline
+        Write-Seg (Format-Cut ($label + '  (' + $m.Items + ' items)') ($script:W - 8)) 'White'
+    }
+    Write-Section 'Findings'
+    $c1 = 'Green'; if ($nHigh -gt 0) { $c1 = 'Red' }
+    $c2 = 'Green'; if ($nSus -gt 0) { $c2 = 'Yellow' }
+    Write-Seg ('  Confirmed detections (high confidence): ' + $nHigh) $c1
+    Write-Seg ('  Suspicious findings (need a human look): ' + $nSus) $c2
+    if ($errs -gt 0) { Write-Seg ('  Items that could not be read: ' + $errs + ' (permission or files that disappeared)') 'DarkGray' }
+    Write-Host ''
+    if ($script:LastReportBase) {
+        Write-Seg '  Report saved automatically:' 'Cyan'
+        Write-Seg ('    ' + $script:LastReportBase + '.txt   (also .json)') 'White'
+        Write-Seg ('    Folder: ' + (Split-Path -Parent $script:LastReportBase)) 'DarkGray'
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host ''
+        $a = Read-Choice 'Press Enter to see what was found (or type X to finish)'
+        if ($a -match '^[Xx]') { return $false }
+        return $true
+    }
+    Wait-Enter 'Press Enter to go back'
+    return $false
+}
+
+function Invoke-AutoBody {
+    $script:Findings.Clear(); $script:Observations.Clear(); $script:Errors.Clear(); $script:ModResults.Clear()
+    $script:NextId = 1; $script:RunStart = 0; $script:RunErrStart = 0
+    Invoke-ScanPass 1
+    if (-not $script:CancelAll) { Invoke-InjectionStep; Invoke-MemoryElevationIfNeeded }
+    if (-not $script:CancelAll -and @(Get-BedrockProc).Count -gt 0) {
+        Write-Host ''
+        Write-Status info 'Double-checking everything that can change while the game runs ...'
+        Invoke-ScanPass 2
+    }
+    Confirm-Findings
+    Invoke-Correlation
+    Confirm-Findings
+}
+
+function Start-AutoRun {
+    Import-Config
+    Initialize-Native
+    Initialize-Console
+    try { $Host.UI.RawUI.WindowTitle = 'BEDROCK SS - automatic scan' } catch { }
+    Show-Header -Full
+    Write-Seg '  AUTOMATIC SCAN' 'Magenta'
+    Write-Host ''
+    Write-Seg '  This runs every check by itself, then checks the results a second time.' 'Gray'
+    Write-Seg '  Nothing is changed, deleted or sent anywhere. A report is saved on this PC.' 'Gray'
+    Write-Seg '  You do not need administrator rights; one optional check will ask for permission.' 'Gray'
+    Write-Host ''
+    while (@(Get-BedrockProc).Count -eq 0) {
+        Write-Status warn 'Minecraft Bedrock is not running.'
+        $a = Read-Choice 'Open Minecraft and join a world, then press Enter (type S to scan files only)'
+        if ($a -match '^[Ss]') { break }
+    }
+    $script:Findings.Clear(); $script:Observations.Clear(); $script:Errors.Clear(); $script:ModResults.Clear()
+    $script:NextId = 1
+    Invoke-ScanAction 'Automatic scan' { Invoke-AutoBody }
+    Write-Host ''
+    Write-Status ok 'Finished. You can close this window.'
+    Wait-Enter 'Press Enter to close'
+}
+
 function Invoke-ScanAction {
     param([string]$Title, [scriptblock]$Body)
     if ($script:Busy) { Write-Status warn 'A scan is already running.'; return }
@@ -1516,6 +2324,8 @@ function Invoke-ScanAction {
         $script:RunStart = $script:ModResults.Count
         $script:RunErrStart = $script:Errors.Count
         $script:LastRows = @(); $script:LastCols = @()
+        $script:MemoryDenied = $false
+        $script:RunId = 1
         try { & $Body }
         catch {
             Write-Status bad ("The scan stopped unexpectedly: " + $_.Exception.Message)
@@ -1523,7 +2333,14 @@ function Invoke-ScanAction {
             if ($script:Mod) { $script:Mod = $null }
         }
         $script:LastScan = Get-Date
-        Show-ScanResults $Title
+        if ($script:CancelAll) {
+            Write-Host ''
+            Write-Status warn 'Scan cancelled by you. Nothing was changed on this PC. Showing what was found so far.'
+            Start-Sleep -Milliseconds 1500
+        }
+        $script:LastReportBase = ''
+        try { $script:LastReportBase = Save-Report } catch { Write-Log 'WARN' ('Report could not be saved: ' + $_.Exception.Message) }
+        if (Show-Completion $Title) { Show-ScanResults $Title }
     } finally { $script:Busy = $false }
 }
 
@@ -1537,16 +2354,13 @@ function Invoke-FullScan {
     if (-not $script:CancelAll) { Invoke-SignatureScan }
     if (-not $script:CancelAll) { Invoke-HashScan }
     if (-not $script:CancelAll -and $s.ScanFiles) { Invoke-LuaScan }
+    if (-not $script:CancelAll -and ($s.ScanFiles -or $s.ScanMemory)) { Invoke-StringScan }
     if (-not $script:CancelAll -and $s.ScanMemory) { Invoke-MemoryScan }
-    if (-not $script:CancelAll -and $s.ScanTraces) { Invoke-InjectionScan }
     if (-not $script:CancelAll -and $s.ScanFiles) { Invoke-RecentFileScan }
+    if (-not $script:CancelAll -and $s.ScanTraces) { Invoke-InjectionStep }
+    if (-not $script:CancelAll) { Invoke-MemoryElevationIfNeeded }
     Invoke-Correlation
     $script:LastRows = @(); $script:LastCols = @()
-    try {
-        $base = Save-Report
-        Write-Host ''
-        Write-Status ok ('Evidence saved: ' + $base + '.json / .txt')
-    } catch { Write-Status warn ('Report could not be saved: ' + $_.Exception.Message) }
 }
 
 # ---------------------------------------------------------------------------
@@ -1611,13 +2425,14 @@ function New-ReportObject {
             Path = $fi.Path; Sha256 = $fi.Sha256; Signature = $fi.Signature; Signer = $fi.Signer; Detected = $fi.Detected
             Modules = @($fi.Modules)
             Indicators = @($fi.Indicators | ForEach-Object { [pscustomobject]@{ Kind = $_.Kind; Text = $_.Text; Weight = $_.Weight } })
-            ObservedFacts = @($fi.Observed); AutomatedInterpretation = $fi.Explanation; RecommendedSteps = @($fi.Steps); Reviewed = $fi.Reviewed
+            ObservedFacts = @($fi.Observed); AutomatedInterpretation = $fi.Explanation; RecommendedSteps = @($fi.Steps); Reviewed = $fi.Reviewed; Confirmation = $fi.Confirmation
         }
     })
     $scope = @(
         'Loaded modules of Minecraft.Windows.exe (path, signature, hash, allowlist, indicator database)',
         'DLL and Lua files inside the Bedrock data folders (RoamingState, LocalState)',
         'Executable memory allocations of Minecraft.Windows.exe (read-only PE header check)',
+        'String scan of added modules, executable/heap memory and Bedrock data files (plain, UTF-16, reversed, Base64, single-byte XOR, Lua escapes)',
         'Execution traces (BAM, Prefetch, running process names) matched against the indicator database',
         ('Recent .dll/.lua/.exe/.zip/.rar/.7z files in Downloads, Desktop, Documents, Temp, Public, Bedrock data (last ' + $script:Cfg.Settings.RecentDays + ' days)'),
         'Not collected: passwords, browser data, cookies, documents, or any personal file contents'
@@ -1920,8 +2735,16 @@ function Show-IndicatorMenu {
         $j = 0
         if (@($script:Cfg.Hashes).Count -eq 0) { Write-Seg '  (none registered)' 'DarkGray' }
         foreach ($h in @($script:Cfg.Hashes)) { $j++; Write-Seg ("  [{0}] {1}  {2}" -f $j, $h.Sha256, $h.Label) 'Gray' }
+        Write-Section 'String signatures (F = feature, U = utility, C = client)'
+        $k = 0; $row = ''
+        foreach ($sg in @($script:Cfg.Strings)) {
+            $k++
+            $row += ('[{0}] {1}({2})' -f $k, $sg.Text, $sg.Group.Substring(0, 1)).PadRight(26)
+            if ($k % 3 -eq 0) { Write-Seg ('  ' + $row) 'Gray'; $row = '' }
+        }
+        if ($row) { Write-Seg ('  ' + $row) 'Gray' }
         Write-Host ''
-        Write-Seg '  [1] add name   [2] remove name   [3] add hash   [4] remove hash   [B] back' 'Cyan'
+        Write-Seg '  [1] add name   [2] remove name   [3] add hash   [4] remove hash   [5] add string   [6] remove string   [B] back' 'Cyan'
         $c = (Read-Choice 'Select').ToUpper()
         switch ($c) {
             '1' {
@@ -1943,6 +2766,18 @@ function Show-IndicatorMenu {
             '4' {
                 $n = Read-Choice 'Number to remove'; $idx = 0; $all = @($script:Cfg.Hashes)
                 if ([int]::TryParse($n, [ref]$idx) -and $idx -ge 1 -and $idx -le $all.Count) { $script:Cfg.Hashes = @($all | Where-Object { $_ -ne $all[$idx - 1] }); [void](Export-Config) }
+            }
+            '5' {
+                $txt = (Read-Choice 'String (4-48 printable ASCII characters)')
+                if ($txt.Length -lt 4 -or $txt.Length -gt 48 -or $txt -notmatch '^[\x20-\x7E]+$') { Write-Status warn 'Invalid string.'; Start-Sleep -Milliseconds 1200; continue }
+                $g = (Read-Choice 'Group: F = feature (counted in clusters), U = utility, C = client name').ToUpper()
+                $grp = @{ 'F' = 'Feature'; 'U' = 'Utility'; 'C' = 'Client' }[$g]
+                if (-not $grp) { Write-Status warn 'Choose F, U or C.'; Start-Sleep -Milliseconds 1000; continue }
+                $script:Cfg.Strings = @($script:Cfg.Strings) + [pscustomobject]@{ Text = $txt; Group = $grp; Note = 'Added by staff' }; [void](Export-Config)
+            }
+            '6' {
+                $n = Read-Choice 'Number to remove'; $idx = 0; $all = @($script:Cfg.Strings)
+                if ([int]::TryParse($n, [ref]$idx) -and $idx -ge 1 -and $idx -le $all.Count) { $script:Cfg.Strings = @($all | Where-Object { $_ -ne $all[$idx - 1] }); [void](Export-Config) }
             }
             'B' { return }
             '' { return }
@@ -1967,7 +2802,8 @@ function Show-SettingsMenu {
             @('9', 'Scan category: files (Lua, data folders, recent files)', (& $onoff $s.ScanFiles)),
             @('10', 'Scan category: execution traces (BAM/Prefetch/processes)', (& $onoff $s.ScanTraces)),
             @('11', 'Known indicator database', ([string]@($script:Cfg.Tokens).Count + ' names, ' + [string]@($script:Cfg.Hashes).Count + ' hashes')),
-            @('12', 'Reset all settings to defaults', '')
+            @('12', 'String scan memory depth (Standard/Deep)', [string]$s.StringScope),
+            @('13', 'Reset all settings to defaults', '')
         )
         foreach ($it in $items) {
             Write-Seg ('  [' + $it[0].PadLeft(2) + '] ') 'Cyan' -NoNewline
@@ -1998,7 +2834,8 @@ function Show-SettingsMenu {
             '9' { $s.ScanFiles = -not $s.ScanFiles; [void](Export-Config) }
             '10' { $s.ScanTraces = -not $s.ScanTraces; [void](Export-Config) }
             '11' { Show-IndicatorMenu }
-            '12' {
+            '12' { if ($s.StringScope -eq 'Standard') { $s.StringScope = 'Deep' } else { $s.StringScope = 'Standard' }; [void](Export-Config) }
+            '13' {
                 $ok = Read-Choice 'Reset settings, allowlist and indicator database to defaults? (Y/N)'
                 if ($ok -match '^[Yy]') { $script:Cfg = New-DefaultConfig; [void](Export-Config); Initialize-Console }
             }
@@ -2052,7 +2889,8 @@ function Show-MainMenu {
         @(10, 'Evidence Reports', 'View, compare and save reports'),
         @(11, 'Allowlist Management', 'Legitimate software that should not be flagged'),
         @(12, 'Settings', 'Scan options, report folder, appearance, indicators'),
-        @(13, 'Exit', '')
+        @(13, 'String Scanner', 'Obfuscation-aware cheat strings in modules, memory and scripts'),
+        @(14, 'Back', 'Return to the simple menu')
     )
     foreach ($it in $items) {
         Write-Seg ('  [' + ([string]$it[0]).PadLeft(2) + '] ') 'Cyan' -NoNewline
@@ -2062,38 +2900,13 @@ function Show-MainMenu {
     Write-Host ''
 }
 
-function Start-BedrockSS {
-    Import-Config
-    Initialize-Native
-    Initialize-Console
-    try { $Host.UI.RawUI.WindowTitle = 'BEDROCK SS - by ' + $script:Publisher } catch { }
-
-    Show-Header -Full
-    Write-Status ok ('Scanner v' + $script:Version + ' by ' + $script:Publisher + ' (indicator database ' + $script:DbVersion + ')')
-    Write-Status ok 'Read-only inspection mode: nothing on this PC is modified, deleted, uploaded or executed.'
-    if ($script:NativeOk) { Write-Status ok 'Memory inspection helper ready.' } else { Write-Status warn 'Memory inspection helper unavailable; the memory scan will be skipped.' }
-    $adm = Test-IsAdmin
-    if ($adm) { Write-Status ok 'Running as Administrator.' }
-    else {
-        Write-Status warn 'Not running as Administrator. Memory, BAM and Prefetch checks may be limited.'
-        if ($script:SelfPath) {
-            $a = Read-Choice 'Relaunch as Administrator now? (Y/N)'
-            if ($a -match '^[Yy]') {
-                try {
-                    Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $script:SelfPath + '"'))
-                    return
-                } catch { Write-Status warn 'Elevation was cancelled. Continuing without Administrator rights.' }
-            }
-        }
-    }
-    if ($script:Cfg.Settings.Animations) { Start-Sleep -Milliseconds 700 }
-
+function Start-AdvancedMenu {
     while ($true) {
         Show-MainMenu
-        $choice = Read-Choice 'Select an option (1-13)'
+        $choice = Read-Choice 'Select an option (1-14)'
         $num = 0
-        if (-not [int]::TryParse($choice, [ref]$num) -or $num -lt 1 -or $num -gt 13) {
-            Write-Status warn 'Invalid selection. Please enter a number from 1 to 13.'
+        if (-not [int]::TryParse($choice, [ref]$num) -or $num -lt 1 -or $num -gt 14) {
+            Write-Status warn 'Invalid selection. Please enter a number from 1 to 14.'
             Start-Sleep -Milliseconds 1000
             continue
         }
@@ -2102,21 +2915,17 @@ function Start-BedrockSS {
                 1  { Invoke-ScanAction 'Full System Scan' { Invoke-FullScan } }
                 2  { Invoke-ScanAction 'DLL Scanner' { Invoke-DllScan } }
                 3  { Invoke-ScanAction 'Lua Scanner' { Invoke-LuaScan } }
-                4  { Invoke-ScanAction 'Injection Investigation' { Invoke-InjectionScan; Invoke-Correlation } }
+                4  { Invoke-ScanAction 'Injection Investigation' { Invoke-InjectionStep; Invoke-Correlation } }
                 5  { Show-ProcessInspector }
-                6  { Invoke-ScanAction 'Memory Integrity Scanner' { Invoke-MemoryScan } }
+                6  { Invoke-ScanAction 'Memory Integrity Scanner' { Invoke-MemoryScan; Invoke-MemoryElevationIfNeeded } }
                 7  { Invoke-ScanAction 'Recent File Activity' { Invoke-RecentFileScan } }
                 8  { Invoke-ScanAction 'Digital Signature Scanner' { Invoke-SignatureScan } }
                 9  { Invoke-ScanAction 'Hash Scanner' { Invoke-HashScan } }
                 10 { Show-ReportsMenu }
                 11 { Show-AllowlistMenu }
                 12 { Show-SettingsMenu }
-                13 {
-                    Show-Header 'Goodbye'
-                    Write-Status ok 'Closing BEDROCK SS. Evidence reports remain in the report folder.'
-                    Write-Host ''
-                    return
-                }
+                13 { Invoke-ScanAction 'String Scanner' { Invoke-StringScan; Invoke-MemoryElevationIfNeeded } }
+                14 { return }
             }
         } catch {
             Write-Status bad ('Unexpected error: ' + $_.Exception.Message)
@@ -2127,4 +2936,79 @@ function Start-BedrockSS {
     }
 }
 
-Start-BedrockSS
+function Show-SimpleMenu {
+    Show-Header -Full
+    if (@(Get-BedrockProc).Count -gt 0) { Write-Status ok 'Minecraft Bedrock is running.' }
+    else { Write-Status warn 'Minecraft Bedrock is not running. Open it and join a world for the best results.' }
+    Write-Seg '  Nothing on this PC is changed, deleted or sent anywhere. Reports are saved automatically.' 'DarkGray'
+    if (-not $script:NativeOk) { Write-Status warn 'Memory checks are unavailable on this PC (the helper code could not be built). Everything else still works.' }
+    Write-Host ''
+    Write-Seg '  What would you like to do?' 'White'
+    Write-Host ''
+    $items = @(
+        @(1, 'Quick Scan', 'Programs and scripts connected to Minecraft. About 1 minute.'),
+        @(2, 'Full Scan', 'Everything below, plus a second check. 3-5 minutes. Recommended.'),
+        @(3, 'Hidden Cheat Names', 'Finds cheat names even when they are disguised.'),
+        @(4, 'Recent Files', 'Files that were downloaded or changed lately.'),
+        @(5, 'Windows Traces', 'Injector programs that were run recently (asks permission).'),
+        @(6, 'Last Report', 'Shows the report of your latest scan.'),
+        @(7, 'Advanced Menu', 'Single scanners, allowlist and settings.'),
+        @(8, 'Exit', '')
+    )
+    foreach ($it in $items) {
+        Write-Seg ('   [' + $it[0] + '] ') 'Cyan' -NoNewline
+        Write-Seg ($it[1].PadRight(20)) 'White' -NoNewline
+        Write-Seg (Format-Cut $it[2] ($script:W - 30)) 'DarkGray'
+    }
+    Write-Host ''
+}
+
+function Start-BedrockSS {
+    Import-Config
+    Initialize-Native
+    Initialize-Console
+    try { $Host.UI.RawUI.WindowTitle = 'BEDROCK SS - by ' + $script:Publisher } catch { }
+    if (-not $script:NativeOk) { Write-Log 'WARN' 'Native helper unavailable: memory and string-in-memory checks will be skipped.' }
+
+    while ($true) {
+        Show-SimpleMenu
+        $choice = Read-Choice 'Type a number and press Enter'
+        $num = 0
+        if (-not [int]::TryParse($choice, [ref]$num) -or $num -lt 1 -or $num -gt 8) {
+            Write-Status warn 'Please type a number from 1 to 8.'
+            Start-Sleep -Milliseconds 1000
+            continue
+        }
+        try {
+            switch ($num) {
+                1 { Invoke-ScanAction 'Quick Scan' { Invoke-DllScan; Invoke-SignatureScan; Invoke-HashScan; Invoke-LuaScan } }
+                2 { Invoke-ScanAction 'Full Scan' { Invoke-AutoBody } }
+                3 { Invoke-ScanAction 'Hidden Cheat Names' { Invoke-StringScan; Invoke-MemoryElevationIfNeeded } }
+                4 { Invoke-ScanAction 'Recent Files' { Invoke-RecentFileScan } }
+                5 { Invoke-ScanAction 'Windows Traces' { Invoke-InjectionStep; Invoke-Correlation } }
+                6 {
+                    $files = @(Get-ReportFiles)
+                    if ($files.Count -eq 0) { Write-Status warn 'No report yet. Run a scan first.'; Wait-Enter }
+                    else { Show-ReportViewer $files[0] }
+                }
+                7 { Start-AdvancedMenu }
+                8 {
+                    Show-Header 'Goodbye'
+                    Write-Status ok ('Closing BEDROCK SS. Reports are in: ' + $script:Cfg.Settings.ReportDir)
+                    Write-Host ''
+                    return
+                }
+            }
+        } catch {
+            Write-Status bad ('Something went wrong: ' + $_.Exception.Message)
+            Write-Log 'ERROR' ('Menu action failed: ' + $_.Exception.Message)
+            $script:Busy = $false
+            Wait-Enter
+        }
+    }
+}
+
+# ==== ENTRY POINT ====
+if ($Task) { Start-TaskChild }
+elseif ($Auto) { Start-AutoRun }
+else { Start-BedrockSS }
